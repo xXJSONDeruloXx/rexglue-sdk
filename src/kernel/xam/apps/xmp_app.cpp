@@ -48,17 +48,17 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count,
-                                         uint32_t playlist_name_ptr,
+X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t storage_ptr, uint32_t songs_ptr,
+                                         uint32_t song_count, uint32_t playlist_name_ptr,
                                          const std::u16string& playlist_name, uint32_t flags,
                                          uint32_t out_song_handles, uint32_t out_playlist_handle) {
-  REXKRNL_DEBUG(
-      "XMPCreateTitlePlaylist({:08X}, {:08X}, {:08X}({}), {:08X}, {:08X}, "
-      "{:08X})",
-      songs_ptr, song_count, playlist_name_ptr, rex::string::to_utf8(playlist_name), flags,
+  REXKRNL_WARN(
+      "XMPCreateTitlePlaylist storage={:08X} songs_ptr={:08X} song_count={} name='{}' flags={:08X} song_handles={:08X} out_playlist={:08X}",
+      storage_ptr, songs_ptr, song_count, rex::string::to_utf8(playlist_name), flags,
       out_song_handles, out_playlist_handle);
   auto playlist = std::make_unique<Playlist>();
   playlist->handle = ++next_playlist_handle_;
+  playlist->storage_ptr = storage_ptr;
   playlist->name = playlist_name;
   playlist->flags = flags;
   if (songs_ptr) {
@@ -85,6 +85,12 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
         memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(out_song_handles + (i * 4)),
                                          song->handle);
       }
+      if (i < 4) {
+        REXKRNL_WARN("  song[{}] handle={:08X} format={} path='{}' name='{}' artist='{}' duration_ms={}",
+                     i, song->handle, static_cast<uint32_t>(song->format),
+                     rex::string::to_utf8(song->file_path), rex::string::to_utf8(song->name),
+                     rex::string::to_utf8(song->artist), song->duration_ms);
+      }
       playlist->songs.emplace_back(std::move(song));
     }
   }
@@ -95,6 +101,9 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
 
   auto global_lock = global_critical_region_.Acquire();
   playlists_.insert({playlist->handle, playlist.get()});
+  if (storage_ptr) {
+    playlists_by_storage_ptr_.insert({storage_ptr, playlist.get()});
+  }
   playlist.release();
   return X_E_SUCCESS;
 }
@@ -112,6 +121,9 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
     XMPStop(0);
   }
   playlists_.erase(it);
+  if (playlist->storage_ptr) {
+    playlists_by_storage_ptr_.erase(playlist->storage_ptr);
+  }
   delete playlist;
   return X_E_SUCCESS;
 }
@@ -130,12 +142,11 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   }
 
   if (playback_client_ == PlaybackClient::kSystem) {
-    REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled!");
-    return X_E_SUCCESS;
+    REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled; continuing with title playlist");
   }
 
   // Start playlist?
-  REXKRNL_WARN("Playlist playback not supported");
+  REXKRNL_WARN("Playlist playback not supported yet; activating playlist state only");
   active_playlist_ = playlist;
   active_song_index_ = 0;
   state_ = State::kPlaying;
@@ -202,6 +213,14 @@ void XmpApp::OnStateChanged() {
   kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
 }
 
+XmpApp::Playlist* XmpApp::LookupPlaylistByStoragePtr(uint32_t storage_ptr) const {
+  auto it = playlists_by_storage_ptr_.find(storage_ptr);
+  if (it == playlists_by_storage_ptr_.end()) {
+    return nullptr;
+  }
+  return it->second;
+}
+
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
@@ -212,8 +231,19 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t storage_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t song_handle = memory::load_and_swap<uint32_t>(buffer + 8);  // 0?
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
+      uint32_t playlist_handle = 0;
+      if (auto* playlist = LookupPlaylistByStoragePtr(storage_ptr)) {
+        playlist_handle = playlist->handle;
+        REXKRNL_WARN(
+            "XMPPlayTitlePlaylist request storage={:08X} song={:08X} resolved via storage map to handle={:08X} name='{}' songs={}",
+            storage_ptr, song_handle, playlist_handle, rex::string::to_utf8(playlist->name),
+            playlist->songs.size());
+      } else if (storage_ptr) {
+        playlist_handle = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
+        REXKRNL_WARN(
+            "XMPPlayTitlePlaylist request storage={:08X} song={:08X} not in storage map, fallback deref handle={:08X}",
+            storage_ptr, song_handle, playlist_handle);
+      }
       assert_true(xmp_client == 0x00000002);
       return XMPPlayTitlePlaylist(playlist_handle, song_handle);
     }
@@ -327,9 +357,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
       assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
-      return XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
-                                    playlist_name, args->flags, args->song_handles_ptr,
-                                    args->storage_ptr);
+      return XMPCreateTitlePlaylist(args->storage_ptr, args->songs_ptr, args->song_count,
+                                    args->playlist_name_ptr, playlist_name, args->flags,
+                                    args->song_handles_ptr, args->storage_ptr);
     }
     case 0x0007000E: {
       assert_true(!buffer_length || buffer_length == 12);
@@ -368,8 +398,18 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 8);
 
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
+      uint32_t playlist_handle = 0;
+      if (auto* playlist = LookupPlaylistByStoragePtr(args->storage_ptr)) {
+        playlist_handle = playlist->handle;
+        REXKRNL_WARN("XMPDeleteTitlePlaylist request storage={:08X} resolved via storage map to handle={:08X}",
+                     uint32_t(args->storage_ptr), playlist_handle);
+      } else if (args->storage_ptr) {
+        playlist_handle =
+            memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
+        REXKRNL_WARN(
+            "XMPDeleteTitlePlaylist request storage={:08X} not in storage map, fallback deref handle={:08X}",
+            uint32_t(args->storage_ptr), playlist_handle);
+      }
       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
       return XMPDeleteTitlePlaylist(playlist_handle);
     }
@@ -385,8 +425,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
                   (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
-      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
-                    uint32_t(args->playback_client));
+      REXKRNL_WARN("XMPSetPlaybackController client={:08X} controller={:08X} playback_client={:08X}",
+                   uint32_t(args->xmp_client), uint32_t(args->controller),
+                   uint32_t(args->playback_client));
 
       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
       kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
@@ -403,8 +444,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       static_assert_size(decltype(*args), 12);
 
       assert_true(args->xmp_client == 0x00000002);
-      REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
-                    uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
+      REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})",
+                    uint32_t(args->xmp_client), uint32_t(args->controller_ptr),
+                    uint32_t(args->locked_ptr));
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 

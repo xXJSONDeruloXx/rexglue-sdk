@@ -572,8 +572,7 @@ constexpr bool IsColorResolveFormatBitwiseEquivalent(ColorRenderTargetFormat ren
     case ColorRenderTargetFormat::k_8_8_8_8:
     // Shaders fetch data copied from k_8_8_8_8_GAMMA with TextureSign::kGamma.
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      // TODO(Triang3l): Investigate k_8_8_8_8_A.
-      return color_format == ColorFormat::k_8_8_8_8 || color_format == ColorFormat::k_8_8_8_8_A ||
+      return color_format == ColorFormat::k_8_8_8_8 ||
              color_format == ColorFormat::k_8_8_8_8_AS_16_16_16_16;
     case ColorRenderTargetFormat::k_2_10_10_10:
     case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:

@@ -500,10 +500,9 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_flags,
                                   u64 total_requested, mapped_u32 device_id_ptr,
                                   mapped_void overlapped) {
-  REXKRNL_DEBUG("XamShowDeviceSelectorUI({:08X}, {:08X}, {:08X}, {:016X}, {:08X}, {:08X})",
-                uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
-                uint64_t(total_requested), device_id_ptr.guest_address(),
-                overlapped.guest_address());
+  REXKRNL_WARN("DIAG XamShowDeviceSelectorUI user={:08X} type={:08X} flags={:08X} total={:016X} device_ptr={:08X} ov={:08X}",
+               uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
+               uint64_t(total_requested), device_id_ptr.guest_address(), overlapped.guest_address());
   return xeXamDispatchHeadless(
       [device_id_ptr]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc

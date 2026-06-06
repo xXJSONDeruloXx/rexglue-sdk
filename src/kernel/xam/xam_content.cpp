@@ -138,6 +138,11 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
   auto content_manager = REX_KERNEL_STATE()->content_manager();
 
+  REXKRNL_WARN("DIAG XamContentCreate root='{}' file='{}' type={:08X} flags={:08X} ov={:08X}",
+               root_name.value(), content_data.file_name(),
+               static_cast<uint32_t>(static_cast<XContentType>(content_data.content_type)),
+               uint32_t(flags), overlapped_ptr.guest_address());
+
   if (overlapped_ptr && disposition_ptr) {
     *disposition_ptr = 0;
   }
@@ -216,6 +221,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
+
+    REXKRNL_WARN(
+        "DIAG XamContentCreate complete root='{}' file='{}' result={:08X} disposition={} license={:08X}",
+        root_name, content_data.file_name(), result, uint32_t(disposition), content_license);
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
       *license_mask_ptr = content_license;
@@ -335,8 +344,8 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
     *file_handle_ptr = xfile->handle();
     extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
     length = static_cast<uint32_t>(file_action);
-    REXKRNL_DEBUG("XamContentOpenFile('{}', '{}') -> handle={:08X}", root, rel_path,
-                  xfile->handle());
+    REXKRNL_WARN("DIAG XamContentOpenFile('{}', '{}', flags={:08X}) -> handle={:08X}", root, rel_path,
+                 uint32_t(flags), xfile->handle());
     return X_ERROR_SUCCESS;
   };
 
@@ -352,6 +361,8 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   X_RESULT result = X_ERROR_SUCCESS;
+  REXKRNL_WARN("DIAG XamContentFlush root='{}' ov={:08X}", root_name.value(),
+               overlapped_ptr.guest_address());
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -363,6 +374,8 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  REXKRNL_WARN("DIAG XamContentClose root='{}' result={:08X} ov={:08X}", root_name.value(), result,
+               overlapped_ptr.guest_address());
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -381,6 +394,8 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   bool content_exists = REX_KERNEL_STATE()->content_manager()->ContentExists(xuid, content_data);
+  REXKRNL_WARN("DIAG XamContentGetCreator file='{}' exists={} ov={:08X}",
+               content_data.file_name(), content_exists, overlapped_ptr.guest_address());
 
   if (content_exists) {
     if (content_data.content_type == XContentType::kSavedGame) {
@@ -420,6 +435,11 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   auto result =
       REX_KERNEL_STATE()->content_manager()->GetContentThumbnail(xuid, content_data, &buffer);
 
+  REXKRNL_WARN(
+      "DIAG XamContentGetThumbnail file='{}' result={:08X} in_size={} out_size={} buffer={:08X} ov={:08X}",
+      content_data.file_name(), result, buffer_size, uint32_t(buffer.size()),
+      buffer_ptr.guest_address(), overlapped_ptr.guest_address());
+
   *buffer_size_ptr = uint32_t(buffer.size());
 
   if (XSUCCEEDED(result)) {
@@ -454,6 +474,9 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   auto buffer = std::vector<uint8_t>((uint8_t*)buffer_ptr, (uint8_t*)buffer_ptr + buffer_size);
   auto result = REX_KERNEL_STATE()->content_manager()->SetContentThumbnail(xuid, content_data,
                                                                            std::move(buffer));
+  REXKRNL_WARN("DIAG XamContentSetThumbnail file='{}' size={} result={:08X} ov={:08X}",
+               content_data.file_name(), uint32_t(buffer_size), result,
+               overlapped_ptr.guest_address());
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -469,6 +492,8 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
+  REXKRNL_WARN("DIAG XamContentDelete file='{}' result={:08X} ov={:08X}",
+               content_data.file_name(), result, overlapped_ptr.guest_address());
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -485,6 +510,8 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
+  REXKRNL_WARN("DIAG XamContentDeleteInternal file='{}' result={:08X} ov={:08X}",
+               content_data.file_name(), result, overlapped_ptr.guest_address());
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
