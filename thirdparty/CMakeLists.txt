@@ -3,6 +3,14 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 #=============================================================================
+# Windows: SDL3 transitively pulls in -lm which doesn't exist on MSVC.
+# Math functions are in the MSVC runtime. Remove -lm from SDL3's link libs.
+#=============================================================================
+if(WIN32)
+    # We'll fix this after SDL3 is configured
+endif()
+
+#=============================================================================
 # Architecture detection
 #=============================================================================
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
@@ -271,6 +279,19 @@ if(UNIX AND NOT APPLE)
 endif()
 
 add_subdirectory(sdl3)
+
+# Windows: SDL3 pulls in -lm (math lib) which doesn't exist on MSVC.
+# Math functions are already in the MSVC runtime. Strip it out.
+if(WIN32 AND TARGET SDL3::SDL3)
+    get_target_property(_sdl3_links SDL3::SDL3 INTERFACE_LINK_LIBRARIES)
+    if(_sdl3_links MATCHES "-lm")
+        string(REPLACE "-lm" "" _sdl3_links "${_sdl3_links}")
+        # Clean up any double spaces
+        string(REGEX REPLACE "  +" " " _sdl3_links "${_sdl3_links}")
+        set_target_properties(SDL3::SDL3 PROPERTIES INTERFACE_LINK_LIBRARIES "${_sdl3_links}")
+    endif()
+    unset(_sdl3_links)
+endif()
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
@@ -667,5 +688,77 @@ if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
 endif()
 
+#=============================================================================
+# libavformat - FFmpeg container/library for ASF/WMA demuxing (for XMP music)
+# Only builds a minimal set of files needed for ASF/WMA playback.
+# Auto-generated list files (codec_list, demuxer_list, etc.) are excluded
+# because they reference symbols from formats/protocols not in our build.
+#=============================================================================
+
+set(FFMPEG_AVFORMAT_SOURCES
+    # Core infrastructure
+    ${FFMPEG_DIR}/libavformat/format.c
+    ${FFMPEG_DIR}/libavformat/avio.c
+    ${FFMPEG_DIR}/libavformat/aviobuf.c
+    ${FFMPEG_DIR}/libavformat/options.c
+    ${FFMPEG_DIR}/libavformat/utils.c
+    ${FFMPEG_DIR}/libavformat/os_support.c
+    ${FFMPEG_DIR}/libavformat/url.c
+    ${FFMPEG_DIR}/libavformat/crypto.c
+    ${FFMPEG_DIR}/libavformat/metadata.c
+    ${FFMPEG_DIR}/libavformat/subtitles.c
+    ${FFMPEG_DIR}/libavformat/dump.c
+    ${FFMPEG_DIR}/libavformat/apetag.c
+    ${FFMPEG_DIR}/libavformat/id3v1.c
+    ${FFMPEG_DIR}/libavformat/id3v2.c
+    ${FFMPEG_DIR}/libavformat/vorbiscomment.c
+    ${FFMPEG_DIR}/libavformat/golomb_tab.c
+    ${FFMPEG_DIR}/libavformat/log2_tab.c
+    # IO protocols (file only — network protocols not needed for local .wma playback)
+    ${FFMPEG_DIR}/libavformat/file.c
+    # ASF demuxer (for .wma files)
+    ${FFMPEG_DIR}/libavformat/asf.c
+    ${FFMPEG_DIR}/libavformat/asfdec_f.c
+    ${FFMPEG_DIR}/libavformat/asfdec_o.c
+    ${FFMPEG_DIR}/libavformat/asfcrypt.c
+    # WAV/RIFF support
+    ${FFMPEG_DIR}/libavformat/aiff.c
+    ${FFMPEG_DIR}/libavformat/aiffdec.c
+    ${FFMPEG_DIR}/libavformat/wavdec.c
+    ${FFMPEG_DIR}/libavformat/wavenc.c
+    ${FFMPEG_DIR}/libavformat/riff.c
+    ${FFMPEG_DIR}/libavformat/riffdec.c
+    # Misc needed
+    ${FFMPEG_DIR}/libavformat/pcm.c
+    ${FFMPEG_DIR}/libavformat/pcmdec.c
+    ${FFMPEG_DIR}/libavformat/rawdec.c
+    ${FFMPEG_DIR}/libavformat/img2.c
+    ${FFMPEG_DIR}/libavformat/img2dec.c
+    # Stubs for symbols normally from allformats.c / protocols.c (auto-generated lists)
+    ${FFMPEG_DIR}/libavformat/stubs.c
+)
+
+add_library(libavformat STATIC ${FFMPEG_AVFORMAT_SOURCES})
+
+# Windows-specific source
+if(WIN32)
+    target_sources(libavformat PRIVATE
+        ${FFMPEG_DIR}/libavformat/file_open.c
+    )
+endif()
+
+target_include_directories(libavformat
+    PUBLIC
+        $<BUILD_INTERFACE:${FFMPEG_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+)
+target_compile_definitions(libavformat PRIVATE ${FFMPEG_COMMON_DEFINES})
+target_compile_options(libavformat PRIVATE -w)  # Suppress warnings in third-party code
+target_link_libraries(libavformat PUBLIC libavcodec libavutil)
+if(WIN32)
+    target_link_libraries(libavformat PRIVATE bcrypt)
+endif()
+
 # IDE folder organization
-set_target_properties(libavutil libavcodec PROPERTIES FOLDER "FFmpeg")
+set_target_properties(libavutil libavcodec libavformat PROPERTIES FOLDER "FFmpeg")

@@ -18,6 +18,9 @@
 #include <rex/thread.h>
 #include <algorithm>
 #include <cctype>
+#include <fstream>
+#include <vector>
+#include <cstring>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -237,7 +240,7 @@ void XmpApp::AutoDiscoverTitleMusic() {
   REXKRNL_WARN("XMP: No eatrax/ directory found or no music files discovered");
 }
 
-Playlist* XmpApp::GetOrCreateDefaultPlaylist() {
+XmpApp::Playlist* XmpApp::GetOrCreateDefaultPlaylist() {
   if (!auto_discovered_) {
     AutoDiscoverTitleMusic();
   }
@@ -313,24 +316,10 @@ void XmpApp::PlaybackThreadMain() {
   }
 
   // Register an audio render client for XMP playback
-  uint32_t driver_handle = 0;
-  {
-    uint8_t* callback_buf = memory_->SystemHeapAlloc(8, 4, memory::kSystemHeapPhysical);
-    if (callback_buf) {
-      uint32_t* cb = reinterpret_cast<uint32_t*>(callback_buf);
-      cb[0] = 0;  // callback (unused)
-      cb[1] = 0;  // callback_arg
-      uint32_t* handle_out = reinterpret_cast<uint32_t*>(host_pcm_buffer);
-      // Use XAudioRegisterRenderDriverClient through the kernel function
-      // For simplicity, we use client index 0 directly (same as XAudioRegisterRenderDriverClient)
-      size_t client_index = 0;
-      audio_system->RegisterClient(0, 0, &client_index);
-      driver_handle = 0x41550000 | static_cast<uint32_t>(client_index & 0x0000FFFF);
-      memory_->SystemHeapFree(reinterpret_cast<uint32_t>(callback_buf));
-    }
-  }
+  size_t client_index = 0;
+  audio_system->RegisterClient(0, 0, &client_index);
 
-  REXKRNL_INFO("XMP: Playback thread started, driver={:08X}", driver_handle);
+  REXKRNL_INFO("XMP: Playback thread started, client_index={}", client_index);
 
   while (playback_running_.load()) {
     // Get current song
@@ -348,7 +337,7 @@ void XmpApp::PlaybackThreadMain() {
     auto& song = playlist->songs[song_index];
     // file_path is stored as the host filesystem path (std::u16string but contains host path)
     std::string host_path = std::string(song->file_path.begin(), song->file_path.end());
-    REXKRNL_INFO("XMP: Playing song '{}' ({})", song->name.data(), host_path);
+    REXKRNL_INFO("XMP: Playing song (file: {})", host_path);
 
     // Open the file using FFmpeg
     AVFormatContext* fmt_ctx = nullptr;
@@ -382,14 +371,15 @@ void XmpApp::PlaybackThreadMain() {
     AVCodecParameters* codec_params = fmt_ctx->streams[audio_stream_index]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
-      REXKRNL_WARN("XMP: No decoder found for codec {} in '{}'", codec_params->codec_id,
+      REXKRNL_WARN("XMP: No decoder found for codec {} in '{}'", (int)codec_params->codec_id,
                     host_path);
       avformat_close_input(&fmt_ctx);
       break;
     }
 
-    std::unique_ptr<AVCodecContext, decltype(&avcodec_free_context)> codec_ctx(
-        avcodec_alloc_context3(codec), avcodec_free_context);
+    auto codec_deleter = [](AVCodecContext* ctx) { if (ctx) avcodec_free_context(&ctx); };
+    std::unique_ptr<AVCodecContext, decltype(codec_deleter)> codec_ctx(
+        avcodec_alloc_context3(codec), codec_deleter);
     if (!codec_ctx) {
       REXKRNL_WARN("XMP: Failed to allocate codec context for '{}'", host_path);
       avformat_close_input(&fmt_ctx);
@@ -408,11 +398,15 @@ void XmpApp::PlaybackThreadMain() {
       break;
     }
 
-    REXKRNL_INFO("XMP: Decoding '{}' (codec={}, sample_rate={}, channels={})",
-                 host_path, codec->name, codec_ctx->sample_rate, codec_ctx->channels);
+    REXKRNL_INFO("XMP: Decoding (file={}, codec={}, sample_rate={}, channels={})",
+                 host_path, codec->name, (int)codec_ctx->sample_rate, (int)codec_ctx->channels);
 
-    std::unique_ptr<AVPacket, decltype(&av_packet_free)> packet(av_packet_alloc(), av_packet_free);
-    std::unique_ptr<AVFrame, decltype(&av_frame_free)> frame(av_frame_alloc(), av_frame_free);
+    // av_packet_free/av_frame_free take AVPacket*/AVFrame* (single pointer),
+    // but older FFmpeg APIs take AVPacket**/AVFrame**. Wrap with a lambda.
+    auto packet_deleter = [](AVPacket* p) { if (p) av_packet_free(&p); };
+    auto frame_deleter = [](AVFrame* f) { if (f) av_frame_free(&f); };
+    std::unique_ptr<AVPacket, decltype(packet_deleter)> packet(av_packet_alloc(), packet_deleter);
+    std::unique_ptr<AVFrame, decltype(frame_deleter)> frame(av_frame_alloc(), frame_deleter);
 
     // Decode loop
     while (playback_running_.load()) {
@@ -481,12 +475,12 @@ void XmpApp::PlaybackThreadMain() {
       } else {
         // Fallback: try direct copy (for int16 formats)
         // This is a best-effort approach
-        REXKRNL_WARN("XMP: Unsupported sample format {}, skipping frame", codec_ctx->sample_fmt);
+        REXKRNL_WARN("XMP: Unsupported sample format {}, skipping frame", (int)codec_ctx->sample_fmt);
         continue;
       }
 
       // Submit to audio system
-      audio_system->SubmitFrame(driver_handle & 0x0000FFFF, guest_pcm_buffer);
+      audio_system->SubmitFrame(client_index, guest_pcm_buffer);
 
       // Pace playback: sleep proportional to frame duration
       if (frame->sample_rate > 0 && samples > 0) {
@@ -501,7 +495,7 @@ void XmpApp::PlaybackThreadMain() {
     av_packet_unref(packet.get());
     avformat_close_input(&fmt_ctx);
 
-    REXKRNL_INFO("XMP: Finished playing song '{}'", song->name.data());
+    REXKRNL_INFO("XMP: Finished playing song");
 
     // Advance to next song if still running
     if (playback_running_.load() && playlist) {
@@ -519,9 +513,7 @@ void XmpApp::PlaybackThreadMain() {
   memory_->SystemHeapFree(guest_pcm_buffer);
 
   // Unregister audio client
-  if (driver_handle) {
-    audio_system->UnregisterClient(driver_handle & 0x0000FFFF);
-  }
+  audio_system->UnregisterClient(client_index);
 
   REXKRNL_INFO("XMP: Playback thread exiting");
 }
