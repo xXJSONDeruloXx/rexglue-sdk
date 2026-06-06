@@ -67,3 +67,6 @@ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexgraphics rexui rexaudio rexinput imgui)
+
+# FFmpeg libraries for XMP music playback (WMA/ASF demuxing + codec decoding)
+target_link_libraries(rexruntime PRIVATE libavformat libavcodec libavutil)

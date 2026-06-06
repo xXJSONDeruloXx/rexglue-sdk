@@ -406,11 +406,13 @@ bool D3D12Provider::Initialize() {
   // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED requires Windows 10 2004 (indicated by
   // the availability of ID3D12Device8 or D3D12_FEATURE_D3D12_OPTIONS7).
   heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_NONE;
+#if defined(D3D12_FEATURE_D3D12_OPTIONS7)
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
   if (SUCCEEDED(
           device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7)))) {
     heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
   }
+#endif
   ps_specified_stencil_reference_supported_ = false;
   rasterizer_ordered_views_supported_ = false;
   resource_binding_tier_ = D3D12_RESOURCE_BINDING_TIER_1;
@@ -430,11 +432,13 @@ bool D3D12Provider::Initialize() {
           device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &options2, sizeof(options2)))) {
     programmable_sample_positions_tier_ = options2.ProgrammableSamplePositionsTier;
   }
+#if defined(D3D12_FEATURE_D3D12_OPTIONS8)
   D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8;
   if (SUCCEEDED(
           device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)))) {
     unaligned_block_textures_supported_ = bool(options8.UnalignedBlockTexturesSupported);
   }
+#endif
   virtual_address_bits_per_resource_ = 0;
   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT virtual_address_support;
   if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT,
@@ -454,7 +458,11 @@ bool D3D12Provider::Initialize() {
       "* Tiled resources: tier {}\n"
       "* Unaligned block-compressed textures: {}",
       virtual_address_bits_per_resource_,
+#if defined(D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)
       (heap_flag_create_not_zeroed_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) ? "yes" : "no",
+#else
+      "no",
+#endif
       ps_specified_stencil_reference_supported_ ? "yes" : "no",
       uint32_t(programmable_sample_positions_tier_),
       rasterizer_ordered_views_supported_ ? "yes" : "no", uint32_t(resource_binding_tier_),
