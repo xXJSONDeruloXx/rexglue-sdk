@@ -19,6 +19,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
+#include <rex/system/xfile.h>
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(license_mask, 0, "Kernel", "Set license mask for activated content");
@@ -262,10 +263,91 @@ u32 XamContentCreateInternal_entry(mapped_string root_name, mapped_void content_
 }
 
 u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_string path, u32 flags,
-                             mapped_u32 disposition_ptr, mapped_u32 license_mask_ptr,
+                             mapped_u32 file_handle_ptr, mapped_u32 possible_overlapped_ptr,
                              mapped_void overlapped_ptr) {
-  // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  // XamContentOpenFile opens a file relative to a mounted content root and returns
+  // an XFile handle. Older rexglue had this stubbed as FILE_NOT_FOUND, which can
+  // leave games spinning on save/load screens after XamContentCreate succeeds.
+  //
+  // XDK signatures seen in the wild pass an output file handle as arg 5 and an
+  // optional XOVERLAPPED as arg 6. Keep the old 7-argument shape for ABI
+  // compatibility with the export thunk, but treat arg 6 as overlapped when arg 7
+  // is null.
+  const uint32_t actual_overlapped =
+      overlapped_ptr ? overlapped_ptr.guest_address() : possible_overlapped_ptr.guest_address();
+
+  auto run = [root = root_name.value(), rel_path = path.value(), flags,
+              file_handle_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    if (!file_handle_ptr) {
+      extended_error = X_HRESULT_FROM_WIN32(X_ERROR_INVALID_PARAMETER);
+      length = 0;
+      return X_ERROR_INVALID_PARAMETER;
+    }
+
+    std::string vfs_path(root);
+    if (!vfs_path.ends_with(':')) {
+      vfs_path += ':';
+    }
+    if (!rel_path.empty() && rel_path[0] != '\\' && rel_path[0] != '/') {
+      vfs_path += '\\';
+    }
+    vfs_path += rel_path;
+
+    rex::filesystem::FileDisposition disposition = rex::filesystem::FileDisposition::kOpen;
+    switch (flags & 0xF) {
+      case 1:
+        disposition = rex::filesystem::FileDisposition::kCreate;
+        break;
+      case 2:
+        disposition = rex::filesystem::FileDisposition::kOverwriteIf;
+        break;
+      case 3:
+      case 0:
+        disposition = rex::filesystem::FileDisposition::kOpen;
+        break;
+      case 4:
+        disposition = rex::filesystem::FileDisposition::kOpenIf;
+        break;
+      case 5:
+        disposition = rex::filesystem::FileDisposition::kOverwrite;
+        break;
+      default:
+        disposition = rex::filesystem::FileDisposition::kOpen;
+        break;
+    }
+
+    rex::filesystem::File* vfs_file = nullptr;
+    rex::filesystem::FileAction file_action = rex::filesystem::FileAction::kOpened;
+    const uint32_t desired_access = rex::filesystem::FileAccess::kGenericRead |
+                                    rex::filesystem::FileAccess::kGenericWrite;
+    X_STATUS status = REX_KERNEL_FS()->OpenFile(nullptr, vfs_path, disposition, desired_access,
+                                                false, true, &vfs_file, &file_action);
+    if (XFAILED(status) || !vfs_file) {
+      REXKRNL_WARN("XamContentOpenFile('{}', '{}', flags={:08X}) failed: {:08X}", root, rel_path,
+                   uint32_t(flags), status);
+      *file_handle_ptr = X_INVALID_HANDLE_VALUE;
+      extended_error = X_HRESULT_FROM_WIN32(X_ERROR_FILE_NOT_FOUND);
+      length = 0;
+      return X_ERROR_FILE_NOT_FOUND;
+    }
+
+    auto* xfile = new XFile(REX_KERNEL_STATE(), vfs_file, true);
+    *file_handle_ptr = xfile->handle();
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
+    length = static_cast<uint32_t>(file_action);
+    REXKRNL_DEBUG("XamContentOpenFile('{}', '{}') -> handle={:08X}", root, rel_path,
+                  xfile->handle());
+    return X_ERROR_SUCCESS;
+  };
+
+  if (actual_overlapped) {
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, actual_overlapped);
+    return X_ERROR_IO_PENDING;
+  }
+
+  uint32_t extended_error = 0;
+  uint32_t length = 0;
+  return run(extended_error, length);
 }
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
