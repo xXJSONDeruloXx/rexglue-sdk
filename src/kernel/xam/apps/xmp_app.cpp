@@ -335,9 +335,31 @@ void XmpApp::PlaybackThreadMain() {
     }
 
     auto& song = playlist->songs[song_index];
-    // file_path is stored as the host filesystem path (std::u16string but contains host path)
-    std::string host_path = std::string(song->file_path.begin(), song->file_path.end());
-    REXKRNL_INFO("XMP: Playing song (file: {})", host_path);
+    std::string file_path_str = std::string(song->file_path.begin(), song->file_path.end());
+    REXKRNL_INFO("XMP: Playing song (path: {})", file_path_str);
+
+    // Resolve VFS path (GAME:\eatrax\NN.wma) to host filesystem path
+    std::string host_path;
+    auto* vfs = kernel_state_->file_system();
+    if (vfs) {
+      auto* entry = vfs->ResolvePath(file_path_str);
+      if (entry) {
+        auto* host_entry = dynamic_cast<filesystem::HostPathEntry*>(entry);
+        if (host_entry) {
+          host_path = host_entry->host_path().string();
+          REXKRNL_INFO("XMP: Resolved VFS path '{}' -> '{}'", file_path_str, host_path);
+        } else {
+          REXKRNL_WARN("XMP: VFS entry '{}' is not a HostPathEntry", file_path_str);
+        }
+      } else {
+        REXKRNL_WARN("XMP: Failed to resolve VFS path '{}'", file_path_str);
+      }
+    }
+
+    // Fallback: use the path directly (may be a host path from auto-discovery)
+    if (host_path.empty()) {
+      host_path = file_path_str;
+    }
 
     // Open the file using FFmpeg
     AVFormatContext* fmt_ctx = nullptr;
