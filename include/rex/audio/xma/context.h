@@ -266,8 +266,10 @@ class XmaContext {
   AVCodecContext* av_context_ = nullptr;
   AVFrame* av_frame_ = nullptr;
 
-  // Packet data buffer (two packets worth for split frame handling)
-  std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;
+  // Packet data buffer for split/spanning frame handling. XMA frame sizes are 15-bit
+  // and may need more than the current packet plus one continuation packet when
+  // starting late in a packet.
+  std::array<uint8_t, kBytesPerPacketData * 4> input_buffer_;
   // First byte contains bit offset information
   std::array<uint8_t, 1 + 4096> xma_frame_;
   // Conversion buffer for up to 2-channel frame

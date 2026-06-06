@@ -581,56 +581,94 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t packet_to_skip = skip_count + 1;
   const uint32_t next_packet_index = packet_index + packet_to_skip;
 
-  // Frame header split across packet boundary.
+  const uint32_t packet_data_bits = kBitsPerPacket - kBitsPerPacketHeader;
+
+  auto get_packet_by_index = [&](uint32_t absolute_packet_index) -> const uint8_t* {
+    if (absolute_packet_index < current_input_packet_count) {
+      return current_input_buffer + absolute_packet_index * kBytesPerPacket;
+    }
+
+    const uint8_t next_buffer_index = data->current_buffer ^ 1;
+    if (!data->IsInputBufferValid(next_buffer_index)) {
+      return nullptr;
+    }
+
+    const uint32_t next_buffer_packet_index = absolute_packet_index - current_input_packet_count;
+    if (next_buffer_packet_index >= data->GetInputBufferPacketCount(next_buffer_index)) {
+      return nullptr;
+    }
+
+    const uint32_t next_buffer_address = data->GetInputBufferAddress(next_buffer_index);
+    if (!next_buffer_address) {
+      REXAPU_ERROR("XmaContext {}: Next buffer marked valid but has null pointer!", id());
+      return nullptr;
+    }
+
+    return memory()->TranslatePhysical(next_buffer_address) +
+           next_buffer_packet_index * kBytesPerPacket;
+  };
+
+  auto assemble_packet_payloads = [&](uint32_t frame_offset_in_packet,
+                                      uint32_t bits_needed) -> uint32_t {
+    if (frame_offset_in_packet < kBitsPerPacketHeader || bits_needed == 0) {
+      return 0;
+    }
+
+    const uint32_t first_payload_bit = frame_offset_in_packet - kBitsPerPacketHeader;
+    const uint64_t payload_bits_needed = uint64_t(first_payload_bit) + bits_needed;
+    uint32_t packets_needed =
+        static_cast<uint32_t>((payload_bits_needed + packet_data_bits - 1) / packet_data_bits);
+    packets_needed = std::max<uint32_t>(packets_needed, 1);
+
+    const uint32_t packet_capacity = static_cast<uint32_t>(input_buffer_.size() / kBytesPerPacketData);
+    if (packets_needed > packet_capacity) {
+      REXAPU_ERROR("XmaContext {}: XMA frame needs {} packets, capacity is {}", id(),
+                   packets_needed, packet_capacity);
+      return 0;
+    }
+
+    input_buffer_.fill(0);
+    for (uint32_t i = 0; i < packets_needed; ++i) {
+      const uint8_t* src_packet = get_packet_by_index(static_cast<uint32_t>(packet_index) + i);
+      if (!src_packet) {
+        return 0;
+      }
+      std::memcpy(input_buffer_.data() + i * kBytesPerPacketData,
+                  src_packet + kBytesPerPacketHeader, kBytesPerPacketData);
+    }
+
+    return packets_needed * packet_data_bits;
+  };
+
+  // Frame header split across packet boundary. Assemble consecutive packet payloads;
+  // packet skip metadata points to where the next frame begins, not necessarily to
+  // the immediate continuation packet for this frame.
   if (packet_info.current_frame_size_ == 0) {
-    const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
-    if (!next_packet) {
+    const uint32_t assembled_bits = assemble_packet_payloads(relative_offset, kBitsPerFrameHeader);
+    if (!assembled_bits) {
       SwapInputBuffer(data);
       return;
     }
-    std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
-    std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
-                kBytesPerPacketData);
 
-    BitStream combined(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
+    BitStream combined(input_buffer_.data(), assembled_bits);
     combined.SetOffset(relative_offset - kBitsPerPacketHeader);
 
     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
-    if (frame_size == xma::kMaxFrameLength) {
+    if (frame_size == 0 || frame_size == xma::kMaxFrameLength) {
       data->error_status = 4;
       return;
     }
     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
   }
 
-  BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
-  stream.SetOffset(data->input_buffer_read_offset);
-
-  const uint64_t bits_to_copy = GetAmountOfBitsToRead(static_cast<uint32_t>(stream.BitsRemaining()),
-                                                      packet_info.current_frame_size_);
-
-  if (bits_to_copy == 0) {
-    REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
-    SwapInputBuffer(data);
+  const uint32_t assembled_bits =
+      assemble_packet_payloads(relative_offset, packet_info.current_frame_size_);
+  if (!assembled_bits) {
+    data->error_status = 4;
     return;
   }
 
-  if (packet_info.isLastFrameInPacket()) {
-    if (stream.BitsRemaining() < packet_info.current_frame_size_) {
-      const uint8_t* next_packet =
-          GetNextPacket(data, next_packet_index, current_input_packet_count);
-      if (!next_packet) {
-        data->error_status = 4;
-        return;
-      }
-      std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
-                  kBytesPerPacketData);
-    }
-  }
-
-  std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
-
-  stream = BitStream(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
+  BitStream stream(input_buffer_.data(), assembled_bits);
   stream.SetOffset(relative_offset - kBitsPerPacketHeader);
 
   xma_frame_.fill(0);
@@ -667,27 +705,47 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   // Compute where to go next.
   if (!packet_info.isLastFrameInPacket()) {
     const uint32_t next_frame_offset =
-        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
+        (data->input_buffer_read_offset + packet_info.current_frame_size_) % kBitsPerPacket;
     data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
     return;
   }
 
-  uint32_t next_input_offset =
-      GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
+  if (next_packet_index < current_input_packet_count) {
+    uint32_t next_input_offset =
+        GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
 
-  if (next_input_offset == kBitsPerPacketHeader) {
-    SwapInputBuffer(data);
-    if (data->IsAnyInputBufferValid()) {
-      next_input_offset = xma::GetPacketFrameOffset(
-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+    if (next_input_offset == kBitsPerPacketHeader) {
+      SwapInputBuffer(data);
+      if (data->IsAnyInputBufferValid()) {
+        next_input_offset = xma::GetPacketFrameOffset(
+            memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
 
-      if (next_input_offset > kMaxFrameSizeinBits) {
-        SwapInputBuffer(data);
-        return;
+        if (next_input_offset > kMaxFrameSizeinBits) {
+          SwapInputBuffer(data);
+          return;
+        }
       }
     }
+    data->input_buffer_read_offset = next_input_offset;
+    return;
   }
-  data->input_buffer_read_offset = next_input_offset;
+
+  const uint8_t next_buffer_index = data->current_buffer ^ 1;
+  if (!data->IsInputBufferValid(next_buffer_index)) {
+    SwapInputBuffer(data);
+    return;
+  }
+
+  const uint32_t next_buffer_packet_index = next_packet_index - current_input_packet_count;
+  if (next_buffer_packet_index >= data->GetInputBufferPacketCount(next_buffer_index)) {
+    SwapInputBuffer(data);
+    return;
+  }
+
+  SwapInputBuffer(data);
+  uint8_t* next_input_buffer = GetCurrentInputBuffer(data);
+  data->input_buffer_read_offset = GetNextPacketReadOffset(
+      next_input_buffer, next_buffer_packet_index, data->GetCurrentInputBufferPacketCount());
 }
 
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
