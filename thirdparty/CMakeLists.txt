@@ -3,14 +3,6 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 #=============================================================================
-# Windows: SDL3 transitively pulls in -lm which doesn't exist on MSVC.
-# Math functions are in the MSVC runtime. Remove -lm from SDL3's link libs.
-#=============================================================================
-if(WIN32)
-    # We'll fix this after SDL3 is configured
-endif()
-
-#=============================================================================
 # Architecture detection
 #=============================================================================
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
@@ -162,6 +154,17 @@ set(FMT_DOC OFF CACHE BOOL "" FORCE)
 set(FMT_TEST OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(fmt)
+
+#=============================================================================
+# Windows/clang: spdlog and Tracy both call find_package(Threads) which on
+# clang-cl resolves to pthreads-w32's -lpthread. Windows threads are native
+# (CreateThread, SRWLock) and don't need a pthread library.
+# Create an empty Threads::Threads target before spdlog/Tracy so
+# find_package(Threads) short-circuits to it.
+#=============================================================================
+if(WIN32 AND NOT TARGET Threads::Threads)
+    add_library(Threads::Threads INTERFACE IMPORTED)
+endif()
 target_compile_options(fmt PRIVATE -w)
 
 #=============================================================================
@@ -280,19 +283,6 @@ endif()
 
 add_subdirectory(sdl3)
 
-# Windows: SDL3 pulls in -lm (math lib) which doesn't exist on MSVC.
-# Math functions are already in the MSVC runtime. Strip it out.
-if(WIN32 AND TARGET SDL3::SDL3)
-    get_target_property(_sdl3_links SDL3::SDL3 INTERFACE_LINK_LIBRARIES)
-    if(_sdl3_links MATCHES "-lm")
-        string(REPLACE "-lm" "" _sdl3_links "${_sdl3_links}")
-        # Clean up any double spaces
-        string(REGEX REPLACE "  +" " " _sdl3_links "${_sdl3_links}")
-        set_target_properties(SDL3::SDL3 PROPERTIES INTERFACE_LINK_LIBRARIES "${_sdl3_links}")
-    endif()
-    unset(_sdl3_links)
-endif()
-
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
 #=============================================================================
@@ -353,7 +343,15 @@ if(REXGLUE_ENABLE_TRACY)
     set(TRACY_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/tracy)
     set(TRACY_PUBLIC_DIR ${TRACY_ROOT}/public)
 
-    find_package(Threads REQUIRED)
+    # Windows/clang: find_package(Threads) pulls in -lpthread via pthreads-w32.
+    # Tracy on Windows uses native Win32 threads (CreateThread, WaitForMultipleObjects).
+    # Skip find_package(Threads) entirely and link the needed system libs directly.
+    if(WIN32)
+        set(TRACY_THREAD_LIBS kernel32)
+    else()
+        find_package(Threads REQUIRED)
+        set(TRACY_THREAD_LIBS Threads::Threads)
+    endif()
 
     add_library(TracyClient SHARED ${TRACY_PUBLIC_DIR}/TracyClient.cpp)
     add_library(Tracy::TracyClient ALIAS TracyClient)
@@ -365,7 +363,7 @@ if(REXGLUE_ENABLE_TRACY)
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/tracy>
     )
 
-    target_link_libraries(TracyClient PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    target_link_libraries(TracyClient PUBLIC ${TRACY_THREAD_LIBS} ${CMAKE_DL_LIBS})
 
     if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_link_libraries(TracyClient PUBLIC ws2_32 dbghelp)
