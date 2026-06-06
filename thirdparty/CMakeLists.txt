@@ -697,8 +697,8 @@ set_target_properties(libavutil libavcodec PROPERTIES
 #=============================================================================
 # libavformat - FFmpeg container/library for ASF/WMA demuxing (for XMP music)
 # Only builds a minimal set of files needed for ASF/WMA playback.
-# Auto-generated list files (codec_list, demuxer_list, etc.) are excluded
-# because they reference symbols from formats/protocols not in our build.
+# stubs.c replaces allformats.c / protocols.c with a rexglue-owned registry
+# shim that lists only the demuxers/protocols we actually compile.
 #=============================================================================
 
 set(FFMPEG_AVFORMAT_SOURCES
@@ -740,7 +740,8 @@ set(FFMPEG_AVFORMAT_SOURCES
     ${FFMPEG_DIR}/libavformat/rawdec.c
     ${FFMPEG_DIR}/libavformat/img2.c
     ${FFMPEG_DIR}/libavformat/img2dec.c
-    # Stubs for symbols normally from allformats.c / protocols.c (auto-generated lists)
+    # rexglue registry shim — replaces allformats.c / protocols.c with a
+    # minimal local array of only the demuxers/protocols we actually compile
     ${FFMPEG_DIR}/libavformat/stubs.c
 )
 
