@@ -1058,6 +1058,8 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length) {
+  REXSYS_WARN("DIAG CompleteOverlapped ov={:08X} result={:08X} ext={:08X} len={}",
+              overlapped_ptr, result, extended_error, length);
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1137,7 +1139,7 @@ void KernelState::CompleteOverlappedDeferred(std::function<X_RESULT()> completio
 void KernelState::CompleteOverlappedDeferredEx(
     std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback, uint32_t overlapped_ptr,
     std::function<void()> pre_callback, std::function<void()> post_callback) {
-  REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
+  REXSYS_WARN("DIAG CompleteOverlappedDeferredEx queue ov={:08X}", overlapped_ptr);
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
@@ -1154,8 +1156,8 @@ void KernelState::CompleteOverlappedDeferredEx(
         uint32_t extended_error, length;
         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
         auto result = completion_callback(extended_error, length);
-        REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
-                     result);
+        REXSYS_WARN("DIAG Deferred overlapped ov={:08X} completing result={:08X} ext={:08X} len={}",
+                    overlapped_ptr, result, extended_error, length);
         CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
         if (post_callback) {
           REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);

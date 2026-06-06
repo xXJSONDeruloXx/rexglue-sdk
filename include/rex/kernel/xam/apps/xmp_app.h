@@ -65,6 +65,7 @@ class XmpApp : public system::xam::App {
   };
   struct Playlist {
     uint32_t handle;
+    uint32_t storage_ptr;
     std::u16string name;
     uint32_t flags;
     std::vector<std::unique_ptr<Song>> songs;
@@ -74,7 +75,7 @@ class XmpApp : public system::xam::App {
 
   X_HRESULT XMPGetStatus(uint32_t status_ptr);
 
-  X_HRESULT XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count,
+  X_HRESULT XMPCreateTitlePlaylist(uint32_t storage_ptr, uint32_t songs_ptr, uint32_t song_count,
                                    uint32_t playlist_name_ptr, const std::u16string& playlist_name,
                                    uint32_t flags, uint32_t out_song_handles,
                                    uint32_t out_playlist_handle);
@@ -95,6 +96,7 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
+  Playlist* LookupPlaylistByStoragePtr(uint32_t storage_ptr) const;
 
   State state_;
   PlaybackClient playback_client_;
@@ -107,6 +109,7 @@ class XmpApp : public system::xam::App {
 
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;
+  std::unordered_map<uint32_t, Playlist*> playlists_by_storage_ptr_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
 };
