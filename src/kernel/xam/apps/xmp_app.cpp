@@ -7,18 +7,39 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    2026-06-06 - Added auto-discovery of eatrax/ directory,
+ *                           fallback for garbage playlist handles,
+ *                           and actual WMA audio playback via FFmpeg.
  */
 
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <algorithm>
+#include <cctype>
+
+extern "C" {
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavutil/error.h"
+}  // extern "C"
+
+#include <rex/audio/audio_system.h>
+#include <rex/filesystem/devices/host_path_entry.h>
+#include <rex/filesystem/entry.h>
+#include <rex/filesystem/file.h>
+#include <rex/filesystem/vfs.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+using rex::memory::kSystemHeapPhysical;
 namespace apps {
 using namespace rex::system;
 
@@ -33,7 +54,8 @@ XmpApp::XmpApp(KernelState* kernel_state)
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
-      next_song_handle_(1) {}
+      next_song_handle_(1),
+      xmp_client_id_(0) {}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
@@ -122,43 +144,455 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
   }
   playlists_.erase(it);
   if (playlist->storage_ptr) {
-    playlists_by_storage_ptr_.erase(playlist->storage_ptr);
+    playlists_by_storage_ptr_.erase({playlist->storage_ptr});
   }
   delete playlist;
   return X_E_SUCCESS;
 }
 
-X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
-  REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
+// ---- Auto-discovery of eatrax/ directory ----
+
+void XmpApp::AutoDiscoverTitleMusic() {
+  if (auto_discovered_) {
+    return;
+  }
+  auto_discovered_ = true;
+
+  auto* vfs = kernel_state_->file_system();
+  if (!vfs) {
+    REXKRNL_WARN("XMP: No VFS available for auto-discovery");
+    return;
+  }
+
+  // Try multiple possible paths for the eatrax directory
+  std::vector<std::string> candidate_paths = {
+      "\\Device\\Harddisk0\\Partition1\\eatrax\\",
+      "game:\\eatrax\\",
+      "d:\\eatrax\\",
+  };
+
+  for (const auto& path : candidate_paths) {
+    auto* eatrax_entry = vfs->ResolvePath(path);
+    if (eatrax_entry && eatrax_entry->child_count() > 0) {
+      REXKRNL_INFO("XMP: Auto-discovering title music from '{}'", path);
+
+      auto playlist = std::make_unique<Playlist>();
+      playlist->handle = ++next_playlist_handle_;
+      playlist->storage_ptr = 0;
+      playlist->name = u"Auto-discovered title music";
+      playlist->flags = 0;
+
+      uint32_t song_count = 0;
+      for (size_t i = 0; i < eatrax_entry->child_count(); i++) {
+        auto* child = eatrax_entry->children()[i].get();
+        if (!child) continue;
+
+        std::string name = child->name();
+        // Filter for .wma files (case insensitive)
+        if (name.size() < 4) continue;
+        std::string ext = name.substr(name.size() - 4);
+        bool is_wma = false;
+        for (char& c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (ext == ".wma" || ext == ".xma") {
+          is_wma = true;
+        }
+
+        if (is_wma) {
+          auto song = std::make_unique<Song>();
+          song->handle = ++next_song_handle_;
+          // Get the host path so FFmpeg can open the file directly
+          std::string host_path_str;
+          auto* host_entry = dynamic_cast<filesystem::HostPathEntry*>(child);
+          if (host_entry) {
+            host_path_str = host_entry->host_path().string();
+          } else {
+            host_path_str = name;  // Fallback to VFS name
+          }
+          song->file_path = std::u16string(host_path_str.begin(), host_path_str.end());
+          song->name = std::u16string(name.begin(), name.end());
+          song->artist = u"";
+          song->album = u"";
+          song->album_artist = u"";
+          song->genre = u"";
+          song->track_number = song_count;
+          song->duration_ms = 0;  // Unknown until played
+          song->format = Song::Format::kWma;
+          playlist->songs.emplace_back(std::move(song));
+          song_count++;
+        }
+      }
+
+      if (song_count > 0) {
+        REXKRNL_INFO("XMP: Auto-discovered {} songs from '{}'", song_count, path);
+
+        auto global_lock = global_critical_region_.Acquire();
+        auto_playlist_ = playlist.get();
+        playlists_.insert({playlist->handle, playlist.get()});
+        playlist.release();
+        return;
+      }
+    }
+  }
+
+  REXKRNL_WARN("XMP: No eatrax/ directory found or no music files discovered");
+}
+
+Playlist* XmpApp::GetOrCreateDefaultPlaylist() {
+  if (!auto_discovered_) {
+    AutoDiscoverTitleMusic();
+  }
+  return auto_playlist_;
+}
+
+// ---- Audio playback pipeline ----
+
+void XmpApp::StartPlayback(Playlist* playlist, int song_index) {
+  // Stop any existing playback
+  StopPlayback();
+
+  if (!playlist || playlist->songs.empty()) {
+    return;
+  }
+
+  // Clamp song index
+  if (song_index < 0 || song_index >= static_cast<int>(playlist->songs.size())) {
+    song_index = 0;
+  }
+
+  current_playlist_ = playlist;
+  current_song_index_ = song_index;
+  playback_running_.store(true);
+  playback_paused_.store(false);
+
+  REXKRNL_INFO("XMP: Starting playback thread for playlist handle={:08X}, song_index={}",
+               playlist->handle, song_index);
+
+  playback_thread_ = std::make_unique<std::thread>(
+      [this]() { PlaybackThreadMain(); });
+}
+
+void XmpApp::StopPlayback() {
+  if (!playback_thread_) {
+    return;
+  }
+
+  playback_running_.store(false);
+  playback_cv_.notify_all();
+
+  if (playback_thread_->joinable()) {
+    playback_thread_->join();
+  }
+  playback_thread_.reset();
+
+  current_playlist_ = nullptr;
+  current_song_index_ = 0;
+}
+
+void XmpApp::PlaybackThreadMain() {
+  // Allocate a PCM buffer in guest memory for audio submission.
+  // Xbox 360 audio frames: typically 16 bits per sample, mono or stereo.
+  // We'll use a buffer large enough for ~100ms of audio at 48kHz stereo.
+  constexpr size_t kPcmBufferSize = 2 * 48000 / 10 * 2 * 2;  // 19200 bytes
+
+  uint32_t guest_pcm_buffer = memory_->SystemHeapAlloc(kPcmBufferSize, 64,
+                                                        memory::kSystemHeapPhysical);
+  if (!guest_pcm_buffer) {
+    REXKRNL_ERROR("XMP: Failed to allocate PCM buffer in guest memory");
+    return;
+  }
+
+  uint8_t* host_pcm_buffer = memory_->TranslateVirtual(guest_pcm_buffer);
+  memset(host_pcm_buffer, 0, kPcmBufferSize);
+
+  auto* audio_system =
+      static_cast<audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
+  if (!audio_system) {
+    REXKRNL_ERROR("XMP: No audio system available");
+    memory_->SystemHeapFree(guest_pcm_buffer);
+    return;
+  }
+
+  // Register an audio render client for XMP playback
+  uint32_t driver_handle = 0;
+  {
+    uint8_t* callback_buf = memory_->SystemHeapAlloc(8, 4, memory::kSystemHeapPhysical);
+    if (callback_buf) {
+      uint32_t* cb = reinterpret_cast<uint32_t*>(callback_buf);
+      cb[0] = 0;  // callback (unused)
+      cb[1] = 0;  // callback_arg
+      uint32_t* handle_out = reinterpret_cast<uint32_t*>(host_pcm_buffer);
+      // Use XAudioRegisterRenderDriverClient through the kernel function
+      // For simplicity, we use client index 0 directly (same as XAudioRegisterRenderDriverClient)
+      size_t client_index = 0;
+      audio_system->RegisterClient(0, 0, &client_index);
+      driver_handle = 0x41550000 | static_cast<uint32_t>(client_index & 0x0000FFFF);
+      memory_->SystemHeapFree(reinterpret_cast<uint32_t>(callback_buf));
+    }
+  }
+
+  REXKRNL_INFO("XMP: Playback thread started, driver={:08X}", driver_handle);
+
+  while (playback_running_.load()) {
+    // Get current song
+    Playlist* playlist = current_playlist_;
+    int song_index = current_song_index_;
+
+    if (!playlist || playlist->songs.empty()) {
+      break;
+    }
+
+    if (song_index < 0 || song_index >= static_cast<int>(playlist->songs.size())) {
+      break;
+    }
+
+    auto& song = playlist->songs[song_index];
+    // file_path is stored as the host filesystem path (std::u16string but contains host path)
+    std::string host_path = std::string(song->file_path.begin(), song->file_path.end());
+    REXKRNL_INFO("XMP: Playing song '{}' ({})", song->name.data(), host_path);
+
+    // Open the file using FFmpeg
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, host_path.c_str(), nullptr, nullptr) != 0) {
+      REXKRNL_WARN("XMP: Failed to open file '{}' for playback", host_path);
+      break;
+    }
+
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+      REXKRNL_WARN("XMP: Failed to find stream info for '{}'", host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    // Find the audio stream
+    int audio_stream_index = -1;
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+      if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        audio_stream_index = i;
+        break;
+      }
+    }
+
+    if (audio_stream_index < 0) {
+      REXKRNL_WARN("XMP: No audio stream found in '{}'", host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    // Open the decoder
+    AVCodecParameters* codec_params = fmt_ctx->streams[audio_stream_index]->codecpar;
+    const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
+    if (!codec) {
+      REXKRNL_WARN("XMP: No decoder found for codec {} in '{}'", codec_params->codec_id,
+                    host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    std::unique_ptr<AVCodecContext, decltype(&avcodec_free_context)> codec_ctx(
+        avcodec_alloc_context3(codec), avcodec_free_context);
+    if (!codec_ctx) {
+      REXKRNL_WARN("XMP: Failed to allocate codec context for '{}'", host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    if (avcodec_parameters_to_context(codec_ctx.get(), codec_params) < 0) {
+      REXKRNL_WARN("XMP: Failed to copy codec params for '{}'", host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+      REXKRNL_WARN("XMP: Failed to open codec for '{}'", host_path);
+      avformat_close_input(&fmt_ctx);
+      break;
+    }
+
+    REXKRNL_INFO("XMP: Decoding '{}' (codec={}, sample_rate={}, channels={})",
+                 host_path, codec->name, codec_ctx->sample_rate, codec_ctx->channels);
+
+    std::unique_ptr<AVPacket, decltype(&av_packet_free)> packet(av_packet_alloc(), av_packet_free);
+    std::unique_ptr<AVFrame, decltype(&av_frame_free)> frame(av_frame_alloc(), av_frame_free);
+
+    // Decode loop
+    while (playback_running_.load()) {
+      // Check for pause
+      while (playback_paused_.load() && playback_running_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+
+      if (av_read_frame(fmt_ctx, packet.get()) < 0) {
+        // End of file or error
+        break;
+      }
+
+      if (packet->stream_index != audio_stream_index) {
+        continue;
+      }
+
+      int ret = avcodec_send_packet(codec_ctx.get(), packet.get());
+      if (ret < 0) {
+        continue;
+      }
+
+      ret = avcodec_receive_frame(codec_ctx.get(), frame.get());
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        continue;
+      }
+      if (ret < 0) {
+        REXKRNL_WARN("XMP: Decode error for '{}'", host_path);
+        continue;
+      }
+
+      // Convert to int16 PCM
+      int samples = frame->nb_samples;
+      int channels = codec_ctx->channels;
+      size_t pcm_size = samples * channels * 2;
+
+      if (pcm_size > kPcmBufferSize) {
+        // Buffer too small — truncate to fit
+        samples = static_cast<int>(kPcmBufferSize / (channels * 2));
+      }
+
+      // Simple conversion: assume float32 input, convert to int16
+      if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLT) {
+        for (int ch = 0; ch < channels; ch++) {
+          const float* in = reinterpret_cast<const float*>(frame->data[ch]);
+          int16_t* out = reinterpret_cast<int16_t*>(host_pcm_buffer) + ch;
+          for (int i = 0; i < samples; i++) {
+            float val = in[i] * 32767.0f;
+            val = std::max(-32768.0f, std::min(32767.0f, val));
+            // Interleave channels
+            reinterpret_cast<int16_t*>(host_pcm_buffer)[i * channels + ch] =
+                static_cast<int16_t>(val);
+          }
+        }
+      } else if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+        // Planar float
+        for (int ch = 0; ch < channels; ch++) {
+          const float* in = reinterpret_cast<const float*>(frame->data[ch]);
+          for (int i = 0; i < samples; i++) {
+            float val = in[i] * 32767.0f;
+            val = std::max(-32768.0f, std::min(32767.0f, val));
+            reinterpret_cast<int16_t*>(host_pcm_buffer)[i * channels + ch] =
+                static_cast<int16_t>(val);
+          }
+        }
+      } else {
+        // Fallback: try direct copy (for int16 formats)
+        // This is a best-effort approach
+        REXKRNL_WARN("XMP: Unsupported sample format {}, skipping frame", codec_ctx->sample_fmt);
+        continue;
+      }
+
+      // Submit to audio system
+      audio_system->SubmitFrame(driver_handle & 0x0000FFFF, guest_pcm_buffer);
+
+      // Pace playback: sleep proportional to frame duration
+      if (frame->sample_rate > 0 && samples > 0) {
+        double frame_duration_ms = (1000.0 * samples) / frame->sample_rate;
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            static_cast<int>(std::max(1.0, frame_duration_ms - 5.0))));  // -5ms for processing time
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    }
+
+    av_packet_unref(packet.get());
+    avformat_close_input(&fmt_ctx);
+
+    REXKRNL_INFO("XMP: Finished playing song '{}'", song->name.data());
+
+    // Advance to next song if still running
+    if (playback_running_.load() && playlist) {
+      {
+        std::lock_guard<std::mutex> lock(playback_mutex_);
+        current_song_index_++;
+        if (current_song_index_ >= static_cast<int>(playlist->songs.size())) {
+          current_song_index_ = 0;  // Loop back to start
+        }
+      }
+    }
+  }
+
+  // Clean up
+  memory_->SystemHeapFree(guest_pcm_buffer);
+
+  // Unregister audio client
+  if (driver_handle) {
+    audio_system->UnregisterClient(driver_handle & 0x0000FFFF);
+  }
+
+  REXKRNL_INFO("XMP: Playback thread exiting");
+}
+
+// ---- Playback control ----
+
+bool XmpApp::TryAutoDiscoverAndPlay(uint32_t playlist_handle, uint32_t song_handle) {
+  // Try to find the playlist first
   Playlist* playlist = nullptr;
   {
     auto global_lock = global_critical_region_.Acquire();
     auto it = playlists_.find(playlist_handle);
-    if (it == playlists_.end()) {
-      REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
-      return X_E_NOTFOUND;
+    if (it != playlists_.end()) {
+      playlist = it->second;
     }
-    playlist = it->second;
   }
+
+  if (!playlist) {
+    REXKRNL_WARN("XMP: Playlist {:08X} not found, attempting auto-discovery", playlist_handle);
+    playlist = GetOrCreateDefaultPlaylist();
+    if (playlist) {
+      REXKRNL_INFO("XMP: Fallback to auto-discovered playlist ({} songs)",
+                   playlist->songs.size());
+    } else {
+      REXKRNL_ERROR("XMP: Auto-discovery failed, no music available");
+      return false;
+    }
+  }
+
+  // Find song index from song_handle, or default to 0
+  int song_index = 0;
+  for (int i = 0; i < static_cast<int>(playlist->songs.size()); i++) {
+    if (playlist->songs[i]->handle == song_handle) {
+      song_index = i;
+      break;
+    }
+  }
+
+  // Start playback
+  StartPlayback(playlist, song_index);
+  return true;
+}
+
+X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
+  REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
 
   if (playback_client_ == PlaybackClient::kSystem) {
     REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled; continuing with title playlist");
   }
 
-  // Start playlist?
-  REXKRNL_WARN("Playlist playback not supported yet; activating playlist state only");
-  active_playlist_ = playlist;
-  active_song_index_ = 0;
-  state_ = State::kPlaying;
-  OnStateChanged();
-  kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
-  return X_E_SUCCESS;
+  bool started = TryAutoDiscoverAndPlay(playlist_handle, song_handle);
+
+  if (started) {
+    active_playlist_ = current_playlist_;
+    active_song_index_ = current_song_index_;
+    state_ = State::kPlaying;
+    OnStateChanged();
+    kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+    return X_E_SUCCESS;
+  }
+
+  REXKRNL_ERROR("Playlist {:08X} not found (auto-discovery also failed)", playlist_handle);
+  return X_E_NOTFOUND;
 }
 
 X_HRESULT XmpApp::XMPContinue() {
   REXKRNL_DEBUG("XMPContinue()");
   if (state_ == State::kPaused) {
     state_ = State::kPlaying;
+    playback_paused_.store(false);
+    playback_cv_.notify_all();
   }
   OnStateChanged();
   return X_E_SUCCESS;
@@ -167,7 +601,8 @@ X_HRESULT XmpApp::XMPContinue() {
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
-  active_playlist_ = nullptr;  // ?
+  StopPlayback();
+  active_playlist_ = nullptr;
   active_song_index_ = 0;
   state_ = State::kIdle;
   OnStateChanged();
@@ -178,6 +613,7 @@ X_HRESULT XmpApp::XMPPause() {
   REXKRNL_DEBUG("XMPPause()");
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
+    playback_paused_.store(true);
   }
   OnStateChanged();
   return X_E_SUCCESS;
@@ -188,8 +624,12 @@ X_HRESULT XmpApp::XMPNext() {
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
+  {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    current_song_index_ = (current_song_index_ + 1) % active_playlist_->songs.size();
+    active_song_index_ = current_song_index_;
+  }
   state_ = State::kPlaying;
-  active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
   OnStateChanged();
   return X_E_SUCCESS;
 }
@@ -199,12 +639,16 @@ X_HRESULT XmpApp::XMPPrevious() {
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
-  state_ = State::kPlaying;
-  if (!active_song_index_) {
-    active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
-  } else {
-    --active_song_index_;
+  {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    if (!current_song_index_) {
+      current_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
+    } else {
+      --current_song_index_;
+    }
+    active_song_index_ = current_song_index_;
   }
+  state_ = State::kPlaying;
   OnStateChanged();
   return X_E_SUCCESS;
 }

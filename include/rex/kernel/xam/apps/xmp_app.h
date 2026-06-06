@@ -10,8 +10,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -95,6 +99,16 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
+  // Auto-discovery of eatrax/ directory and fallback for garbage handles
+  void AutoDiscoverTitleMusic();
+  bool TryAutoDiscoverAndPlay(uint32_t playlist_handle, uint32_t song_handle);
+  Playlist* GetOrCreateDefaultPlaylist();
+
+  // Audio playback pipeline
+  void StartPlayback(Playlist* playlist, int song_index);
+  void StopPlayback();
+  void PlaybackThreadMain();
+
   void OnStateChanged();
   Playlist* LookupPlaylistByStoragePtr(uint32_t storage_ptr) const;
 
@@ -107,11 +121,23 @@ class XmpApp : public system::xam::App {
   Playlist* active_playlist_;
   int active_song_index_;
 
+  // Playback thread state
+  std::unique_ptr<std::thread> playback_thread_;
+  std::atomic<bool> playback_running_ = {false};
+  std::atomic<bool> playback_paused_ = {false};
+  std::mutex playback_mutex_;
+  std::condition_variable playback_cv_;
+  Playlist* current_playlist_ = nullptr;
+  int current_song_index_ = 0;
+  bool auto_discovered_ = false;
+  Playlist* auto_playlist_ = nullptr;
+
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;
   std::unordered_map<uint32_t, Playlist*> playlists_by_storage_ptr_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+  uint32_t xmp_client_id_;
 };
 
 }  // namespace apps
