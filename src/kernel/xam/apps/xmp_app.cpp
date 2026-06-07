@@ -18,6 +18,8 @@
 #include <rex/thread.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <fstream>
 #include <vector>
 #include <cstring>
@@ -251,10 +253,14 @@ XmpApp::Playlist* XmpApp::GetOrCreateDefaultPlaylist() {
 // ---- Audio playback pipeline ----
 
 void XmpApp::StartPlayback(Playlist* playlist, int song_index) {
+  REXKRNL_INFO("XMP: StartPlayback(playlist={:08X}, song={}) — stopping old playback first",
+               playlist ? playlist->handle : 0, song_index);
+
   // Stop any existing playback
   StopPlayback();
 
   if (!playlist || playlist->songs.empty()) {
+    REXKRNL_WARN("XMP: StartPlayback — playlist invalid or empty, aborting");
     return;
   }
 
@@ -268,7 +274,7 @@ void XmpApp::StartPlayback(Playlist* playlist, int song_index) {
   playback_running_.store(true);
   playback_paused_.store(false);
 
-  REXKRNL_INFO("XMP: Starting playback thread for playlist handle={:08X}, song_index={}",
+  REXKRNL_INFO("XMP: StartPlayback — launching playback thread (playlist={:08X}, song={})",
                playlist->handle, song_index);
 
   playback_thread_ = std::make_unique<std::thread>(
@@ -277,14 +283,34 @@ void XmpApp::StartPlayback(Playlist* playlist, int song_index) {
 
 void XmpApp::StopPlayback() {
   if (!playback_thread_) {
+    REXKRNL_DEBUG("XMP: StopPlayback() — no active thread");
     return;
   }
 
+  REXKRNL_INFO("XMP: StopPlayback() — signaling thread to stop");
   playback_running_.store(false);
+
+  // Close the format context to unblock av_read_frame().
+  // Guard with mutex: the playback thread may also try to close it
+  // at the end of its song loop. Only one side should actually close.
+  {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    if (playback_fmt_ctx_) {
+      REXKRNL_INFO("XMP: StopPlayback() — closing format context to unblock av_read_frame");
+      AVFormatContext* tmp = static_cast<AVFormatContext*>(playback_fmt_ctx_);
+      playback_fmt_ctx_ = nullptr;
+      avformat_close_input(&tmp);
+    } else {
+      REXKRNL_DEBUG("XMP: StopPlayback() — format context already closed");
+    }
+  }
+
   playback_cv_.notify_all();
 
   if (playback_thread_->joinable()) {
+    REXKRNL_INFO("XMP: StopPlayback() — waiting for thread to join");
     playback_thread_->join();
+    REXKRNL_INFO("XMP: StopPlayback() — thread joined successfully");
   }
   playback_thread_.reset();
 
@@ -294,22 +320,26 @@ void XmpApp::StopPlayback() {
 
 void XmpApp::PlaybackThreadMain() {
   // Audio driver expects: float32, 6-channel sequential BE layout, 256 samples/channel at 48kHz
-  // frame_samples_ = 6 * 256 = 1536 floats = 6144 bytes per frame
   constexpr uint32_t kAudioChannels = 6;
   constexpr uint32_t kChannelSamples = 256;
   constexpr uint32_t kFrameSamples = kAudioChannels * kChannelSamples;  // 1536
   constexpr uint32_t kFrameSize = static_cast<uint32_t>(sizeof(float) * kFrameSamples);  // 6144
   constexpr uint32_t kAudioSampleRate = 48000;
 
+  static_assert(kFrameSize == 6144, "Frame size must be exactly 6144 bytes");
+
+  REXKRNL_INFO("XMP: PlaybackThreadMain — allocating PCM buffer ({} bytes)", kFrameSize);
   uint32_t guest_pcm_buffer = memory_->SystemHeapAlloc(kFrameSize, 64,
                                                         memory::kSystemHeapPhysical);
   if (!guest_pcm_buffer) {
     REXKRNL_ERROR("XMP: Failed to allocate PCM buffer in guest memory");
     return;
   }
+  REXKRNL_INFO("XMP: PlaybackThreadMain — PCM buffer allocated at guest 0x{:08X}", guest_pcm_buffer);
 
   uint8_t* host_pcm_buffer = memory_->TranslateVirtual(guest_pcm_buffer);
 
+  REXKRNL_INFO("XMP: PlaybackThreadMain — getting audio system");
   auto* audio_system =
       static_cast<audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
   if (!audio_system) {
@@ -318,10 +348,13 @@ void XmpApp::PlaybackThreadMain() {
     return;
   }
 
+  REXKRNL_INFO("XMP: PlaybackThreadMain — registering audio client");
   size_t client_index = 0;
   audio_system->RegisterClient(0, 0, &client_index);
+  REXKRNL_INFO("XMP: PlaybackThreadMain — audio client registered (index={})", client_index);
 
-  REXKRNL_INFO("XMP: Playback thread started, client_index={}", client_index);
+  auto wall_start = std::chrono::steady_clock::now();
+  uint32_t total_submitted = 0;
 
   while (playback_running_.load()) {
     Playlist* playlist = current_playlist_;
@@ -334,7 +367,11 @@ void XmpApp::PlaybackThreadMain() {
     std::string file_path_str = std::string(song->file_path.begin(), song->file_path.end());
     REXKRNL_INFO("XMP: Playing song (path: {})", file_path_str);
 
-    // Resolve VFS path to host path
+    auto song_wall_start = std::chrono::steady_clock::now();
+    uint32_t song_submitted = 0;
+    bool reached_eof = false;
+
+    // --- VFS resolve ---
     std::string host_path;
     auto* vfs = kernel_state_->file_system();
     if (vfs) {
@@ -355,7 +392,7 @@ void XmpApp::PlaybackThreadMain() {
       host_path = file_path_str;
     }
 
-    // Open with FFmpeg
+    // --- Open with FFmpeg ---
     REXKRNL_INFO("XMP: Calling avformat_open_input('{}')", host_path);
     AVFormatContext* fmt_ctx = nullptr;
     int ret = avformat_open_input(&fmt_ctx, host_path.c_str(), nullptr, nullptr);
@@ -367,18 +404,21 @@ void XmpApp::PlaybackThreadMain() {
     }
     REXKRNL_INFO("XMP: avformat_open_input succeeded");
 
+    // Store for StopPlayback to unblock av_read_frame
+    playback_fmt_ctx_ = fmt_ctx;
+
     REXKRNL_INFO("XMP: Calling avformat_find_stream_info");
     ret = avformat_find_stream_info(fmt_ctx, nullptr);
     if (ret < 0) {
       char errbuf[128];
       av_strerror(ret, errbuf, sizeof(errbuf));
       REXKRNL_WARN("XMP: avformat_find_stream_info failed for '{}': {} ({})", host_path, errbuf, ret);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
     REXKRNL_INFO("XMP: avformat_find_stream_info succeeded ({} streams)", (int)fmt_ctx->nb_streams);
 
-    // Find the audio stream
     int audio_stream_index = -1;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
       if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -388,16 +428,17 @@ void XmpApp::PlaybackThreadMain() {
     }
     if (audio_stream_index < 0) {
       REXKRNL_WARN("XMP: No audio stream found in '{}'", host_path);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
 
-    // Open the decoder
     AVCodecParameters* codec_params = fmt_ctx->streams[audio_stream_index]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
       REXKRNL_WARN("XMP: No decoder found for codec {} in '{}'", (int)codec_params->codec_id,
                     host_path);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
@@ -407,16 +448,19 @@ void XmpApp::PlaybackThreadMain() {
         avcodec_alloc_context3(codec), codec_deleter);
     if (!codec_ctx) {
       REXKRNL_WARN("XMP: Failed to allocate codec context for '{}'", host_path);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
     if (avcodec_parameters_to_context(codec_ctx.get(), codec_params) < 0) {
       REXKRNL_WARN("XMP: Failed to copy codec params for '{}'", host_path);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
     if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
       REXKRNL_WARN("XMP: Failed to open codec for '{}'", host_path);
+      playback_fmt_ctx_ = nullptr;
       avformat_close_input(&fmt_ctx);
       break;
     }
@@ -426,73 +470,105 @@ void XmpApp::PlaybackThreadMain() {
     REXKRNL_INFO("XMP: Decoding (file={}, codec={}, sample_rate={}, channels={})",
                  host_path, codec->name, src_rate, src_channels);
 
-    // Decode loop: FFmpeg FLTP stereo@src_rate -> 6ch@48kHz sequential BE float32
-    // Pipeline: decode -> interleaved stereo -> resample 44.1->48kHz -> 6ch expand -> BE swap -> submit
     auto packet_deleter = [](AVPacket* p) { if (p) av_packet_free(&p); };
     auto frame_deleter = [](AVFrame* f) { if (f) av_frame_free(&f); };
     std::unique_ptr<AVPacket, decltype(packet_deleter)> packet(av_packet_alloc(), packet_deleter);
     std::unique_ptr<AVFrame, decltype(frame_deleter)> frame(av_frame_alloc(), frame_deleter);
 
-    // Ring buffer: accumulate resampled stereo float32 samples (interleaved LRLRLR)
-    std::vector<float> ring_stereo;
-    ring_stereo.reserve(4096 * 2);
-    size_t ring_read = 0;  // read position (index into ring_stereo, /2 = samples per channel)
+    // Source buffer: interleaved stereo float32 (L,R,L,R,...)
+    std::vector<float> src;
+    src.reserve(16384);  // ~2 frames worth
+    int64_t src_base = 0;       // absolute sample index of src[0]/src[1]
+    double src_pos = 0.0;       // absolute fractional source sample position
 
-    // Resampling: fixed-point phase accumulator
-    // Maps output sample index (48kHz) -> input sample position (src_rate Hz)
-    uint64_t resample_phase = 0;
-    uint64_t resample_phase_inc = (static_cast<uint64_t>(src_rate) << 32) / kAudioSampleRate;
+    // Pacing: target time advances by one frame per submission
+    auto next_frame_time = std::chrono::steady_clock::now();
+    const double resample_ratio = static_cast<double>(src_rate) / kAudioSampleRate;
 
-    auto drain_frame = [&]() {
-      int samples_needed = static_cast<int>(kChannelSamples);
-      int available = static_cast<int>(ring_stereo.size() / 2 - ring_read);
-      if (available < samples_needed) return false;
+    // --- drain_frame lambda ---
+    auto drain_frame = [&, this]() -> bool {
+      int64_t src_sample_count = static_cast<int64_t>(src.size() / 2);
+      int64_t src_avail = src_base + src_sample_count - std::floor(src_pos);
+      const int64_t samples_needed = static_cast<int64_t>(kChannelSamples);  // 256
+      if (src_avail < samples_needed + 1) return false;  // +1 for interpolation lookahead
 
-      // Resample stereo -> 48kHz, expand to 6ch, byte-swap, write to guest buffer
       float* out = reinterpret_cast<float*>(host_pcm_buffer);
       memset(host_pcm_buffer, 0, kFrameSize);
 
-      uint64_t phase = resample_phase;
-      for (int s = 0; s < samples_needed; s++) {
-        // Input position in samples (fixed-point)
-        uint64_t input_pos_fixed = phase;
-        int ipos = static_cast<int>(input_pos_fixed >> 32);
-        int frac = static_cast<int>(input_pos_fixed & 0xFFFFFFFF);
-        float frac_f = static_cast<float>(frac) / 4294967296.0f;
+      for (int64_t s = 0; s < samples_needed; s++) {
+        int64_t i0 = static_cast<int64_t>(std::floor(src_pos));
+        double frac = src_pos - i0;
+        int64_t i0_rel = i0 - src_base;
 
-        // Read input samples (interleaved stereo)
-        float il0 = (static_cast<size_t>(ipos) < ring_stereo.size() / 2) ?
-            ring_stereo[(ipos) * 2] : 0.0f;
-        float ir0 = (static_cast<size_t>(ipos) < ring_stereo.size() / 2) ?
-            ring_stereo[(ipos) * 2 + 1] : 0.0f;
-        float il1 = (static_cast<size_t>(ipos + 1) < ring_stereo.size() / 2) ?
-            ring_stereo[(ipos + 1) * 2] : il0;
-        float ir1 = (static_cast<size_t>(ipos + 1) < ring_stereo.size() / 2) ?
-            ring_stereo[(ipos + 1) * 2 + 1] : ir0;
+        float il0 = 0.0f, ir0 = 0.0f, il1 = 0.0f, ir1 = 0.0f;
+        if (i0_rel >= 0 && static_cast<size_t>(i0_rel) < src.size() / 2) {
+          il0 = src[i0_rel * 2];
+          ir0 = src[i0_rel * 2 + 1];
+        }
+        int64_t i1_rel = i0_rel + 1;
+        if (i1_rel >= 0 && static_cast<size_t>(i1_rel) < src.size() / 2) {
+          il1 = src[i1_rel * 2];
+          ir1 = src[i1_rel * 2 + 1];
+        }
 
-        // Linear interpolation
-        float vl = il0 + (il1 - il0) * frac_f;
-        float vr = ir0 + (ir1 - ir0) * frac_f;
+        float vl = il0 + (il1 - il0) * static_cast<float>(frac);
+        float vr = ir0 + (ir1 - ir0) * static_cast<float>(frac);
 
-        // Write to 6ch sequential buffer (ch * 256 + sample), byte-swapped
-        out[s] = rex::byte_swap(vl);         // ch 0: FL
-        out[kChannelSamples + s] = rex::byte_swap(vr);  // ch 1: FR
-        // ch 2 (FC), ch 3 (LFE), ch 4 (BL), ch 5 (BR) = 0 (already zeroed)
+        // 6ch sequential BE: ch0=FL, ch1=FR, ch2-5=0 (already memset)
+        out[s]                  = rex::byte_swap(vl);
+        out[kChannelSamples + s] = rex::byte_swap(vr);
 
-        phase += resample_phase_inc;
+        src_pos += resample_ratio;
       }
-      resample_phase = phase;
+
+      // Compact: remove samples fully consumed (up to floor(src_pos) - 1)
+      int64_t consumed = static_cast<int64_t>(std::floor(src_pos)) - src_base - 1;
+      if (consumed > 0) {
+        size_t stereo_erase = static_cast<size_t>(consumed);
+        src.erase(src.begin(), src.begin() + stereo_erase * 2);
+        src_base += consumed;
+      }
 
       audio_system->SubmitFrame(client_index, guest_pcm_buffer);
+      song_submitted++;
+      total_submitted++;
+
+      // Pacing: wait until target time for next frame (~5.333 ms)
+      next_frame_time += std::chrono::microseconds(5333);
+      auto now = std::chrono::steady_clock::now();
+      if (now < next_frame_time) {
+        std::this_thread::sleep_for(next_frame_time - now);
+      }
+
+      // Diagnostics every 100 frames
+      if (song_submitted % 100 == 0) {
+        double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - song_wall_start).count();
+        double expected_s = song_submitted * 256.0 / 48000.0;
+        int64_t src_sample_count_cur = static_cast<int64_t>(src.size() / 2);
+        int64_t src_avail_cur = src_base + src_sample_count_cur - static_cast<int64_t>(std::floor(src_pos));
+        REXKRNL_INFO("XMP: [frame {}] expected={:.2f}s wall={:.2f}s src_base={} src_pos={:.1f} src_samples={} src_avail={}",
+                     song_submitted, expected_s, elapsed_s, src_base,
+                     src_pos, (int)src_sample_count_cur, (int)src_avail_cur);
+      }
+
       return true;
     };
 
+    // --- Main decode loop ---
     while (playback_running_.load()) {
       while (playback_paused_.load() && playback_running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
 
-      if (av_read_frame(fmt_ctx, packet.get()) < 0) {
+      ret = av_read_frame(fmt_ctx, packet.get());
+      if (ret < 0) {
+        if (!playback_running_.load()) {
+          REXKRNL_INFO("XMP: av_read_frame returned error — StopPlayback was called (ret={})", ret);
+        } else {
+          REXKRNL_INFO("XMP: av_read_frame returned EOF (ret={})", ret);
+        }
+        reached_eof = true;
         break;
       }
       if (packet->stream_index != audio_stream_index) {
@@ -511,80 +587,124 @@ void XmpApp::PlaybackThreadMain() {
         continue;
       }
 
-      // Convert FLTP to interleaved stereo and append to ring buffer
+      // Append decoded stereo samples to src
       int nb_samples = frame->nb_samples;
       if (frame->format == AV_SAMPLE_FMT_FLTP) {
         const float* left = reinterpret_cast<const float*>(frame->data[0]);
         const float* right = (src_channels > 1) ?
             reinterpret_cast<const float*>(frame->data[1]) : left;
         for (int i = 0; i < nb_samples; i++) {
-          ring_stereo.push_back(left[i]);
-          ring_stereo.push_back(right[i]);
+          src.push_back(left[i]);
+          src.push_back(right[i]);
         }
       } else if (frame->format == AV_SAMPLE_FMT_FLT) {
         const float* data = reinterpret_cast<const float*>(frame->data[0]);
-        ring_stereo.insert(ring_stereo.end(), data, data + nb_samples * src_channels);
+        src.insert(src.end(), data, data + nb_samples * src_channels);
       }
 
-      // Drain frames from ring buffer
+      // Drain: submit frames, paced at real-time rate
       while (playback_running_.load() && drain_frame()) {}
     }
 
-    // Drain remaining samples
-    while (playback_running_.load() && drain_frame()) {}
+    // Flush decoder: send null packet to drain remaining buffered frames
+    avcodec_send_packet(codec_ctx.get(), nullptr);
+    while (playback_running_.load()) {
+      ret = avcodec_receive_frame(codec_ctx.get(), frame.get());
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+      if (ret < 0) break;
 
-    // Final partial frame
-    int remaining = static_cast<int>(ring_stereo.size() / 2 - ring_read);
-    if (remaining > 0) {
-      float* out = reinterpret_cast<float*>(host_pcm_buffer);
-      memset(host_pcm_buffer, 0, kFrameSize);
-
-      uint64_t phase = resample_phase;
-      for (int s = 0; s < remaining; s++) {
-        uint64_t input_pos_fixed = phase;
-        int ipos = static_cast<int>(input_pos_fixed >> 32);
-        int frac = static_cast<int>(input_pos_fixed & 0xFFFFFFFF);
-        float frac_f = static_cast<float>(frac) / 4294967296.0f;
-
-        int actual_pos = static_cast<int>(ring_read) + ipos;
-        float il0 = (static_cast<size_t>(actual_pos) < ring_stereo.size() / 2) ?
-            ring_stereo[actual_pos * 2] : 0.0f;
-        float ir0 = (static_cast<size_t>(actual_pos) < ring_stereo.size() / 2) ?
-            ring_stereo[actual_pos * 2 + 1] : 0.0f;
-        float il1 = il0, ir1 = ir0;
-        if (static_cast<size_t>(actual_pos + 1) < ring_stereo.size() / 2) {
-          il1 = ring_stereo[(actual_pos + 1) * 2];
-          ir1 = ring_stereo[(actual_pos + 1) * 2 + 1];
+      int nb_samples = frame->nb_samples;
+      if (frame->format == AV_SAMPLE_FMT_FLTP) {
+        const float* left = reinterpret_cast<const float*>(frame->data[0]);
+        const float* right = (src_channels > 1) ?
+            reinterpret_cast<const float*>(frame->data[1]) : left;
+        for (int i = 0; i < nb_samples; i++) {
+          src.push_back(left[i]);
+          src.push_back(right[i]);
         }
-
-        out[s] = rex::byte_swap(il0 + (il1 - il0) * frac_f);
-        out[kChannelSamples + s] = rex::byte_swap(ir0 + (ir1 - ir0) * frac_f);
-        phase += resample_phase_inc;
+      } else if (frame->format == AV_SAMPLE_FMT_FLT) {
+        const float* data = reinterpret_cast<const float*>(frame->data[0]);
+        src.insert(src.end(), data, data + nb_samples * src_channels);
       }
-
-      audio_system->SubmitFrame(client_index, guest_pcm_buffer);
+      while (playback_running_.load() && drain_frame()) {}
     }
 
-    avformat_close_input(&fmt_ctx);
+    // Final partial frame (only if we have enough for at least a few samples)
+    {
+      int64_t src_sample_count = static_cast<int64_t>(src.size() / 2);
+      int64_t src_avail = src_base + src_sample_count - static_cast<int64_t>(std::floor(src_pos));
+      if (src_avail > 0) {
+        float* out = reinterpret_cast<float*>(host_pcm_buffer);
+        memset(host_pcm_buffer, 0, kFrameSize);
 
-    REXKRNL_INFO("XMP: Finished playing song");
+        int64_t samples_to_emit = std::min(src_avail, static_cast<int64_t>(kChannelSamples));
+        for (int64_t s = 0; s < samples_to_emit; s++) {
+          int64_t i0 = static_cast<int64_t>(std::floor(src_pos));
+          double frac = src_pos - i0;
+          int64_t i0_rel = i0 - src_base;
+
+          float il0 = 0.0f, ir0 = 0.0f, il1 = 0.0f, ir1 = 0.0f;
+          if (i0_rel >= 0 && static_cast<size_t>(i0_rel) < src.size() / 2) {
+            il0 = src[i0_rel * 2];
+            ir0 = src[i0_rel * 2 + 1];
+          }
+          int64_t i1_rel = i0_rel + 1;
+          if (i1_rel >= 0 && static_cast<size_t>(i1_rel) < src.size() / 2) {
+            il1 = src[i1_rel * 2];
+            ir1 = src[i1_rel * 2 + 1];
+          }
+
+          out[s]                  = rex::byte_swap(il0 + (il1 - il0) * static_cast<float>(frac));
+          out[kChannelSamples + s] = rex::byte_swap(ir0 + (ir1 - ir0) * static_cast<float>(frac));
+          src_pos += resample_ratio;
+        }
+
+        audio_system->SubmitFrame(client_index, guest_pcm_buffer);
+        song_submitted++;
+      }
+    }
+
+    // Only close the format context if StopPlayback didn't already close it.
+    // Guard with mutex to prevent double-free during track switching.
+    {
+      std::lock_guard<std::mutex> lock(playback_mutex_);
+      if (playback_fmt_ctx_ != nullptr) {
+        REXKRNL_INFO("XMP: Song finished naturally — closing format context");
+        playback_fmt_ctx_ = nullptr;
+        avformat_close_input(&fmt_ctx);
+      } else {
+        REXKRNL_INFO("XMP: Song ended — format context already closed by StopPlayback");
+      }
+    }
+
+    double wall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - song_wall_start).count();
+    double expected_elapsed = song_submitted * 256.0 / 48000.0;
+    REXKRNL_INFO("XMP: Finished song — frames={} expected={:.2f}s wall={:.2f}s eof={} stopped={}",
+                 song_submitted, expected_elapsed, wall_elapsed,
+                 reached_eof, !playback_running_.load());
 
     // Advance to next song
     if (playback_running_.load() && playlist) {
-      {
-        std::lock_guard<std::mutex> lock(playback_mutex_);
-        current_song_index_++;
-        if (current_song_index_ >= static_cast<int>(playlist->songs.size())) {
-          current_song_index_ = 0;
-        }
+      std::lock_guard<std::mutex> lock(playback_mutex_);
+      current_song_index_++;
+      if (current_song_index_ >= static_cast<int>(playlist->songs.size())) {
+        current_song_index_ = 0;
       }
+      REXKRNL_INFO("XMP: Advancing to song index={} (of {} songs)",
+                   current_song_index_, playlist->songs.size());
+    } else {
+      REXKRNL_INFO("XMP: Not advancing — running={}, playlist={}",
+                   playback_running_.load(), (bool)playlist);
     }
   }
 
+  REXKRNL_INFO("XMP: PlaybackThreadMain — freeing PCM buffer (guest 0x{:08X})", guest_pcm_buffer);
   memory_->SystemHeapFree(guest_pcm_buffer);
+  REXKRNL_INFO("XMP: PlaybackThreadMain — unregistering audio client (index={})", client_index);
   audio_system->UnregisterClient(client_index);
 
-  REXKRNL_INFO("XMP: Playback thread exiting");
+  REXKRNL_INFO("XMP: PlaybackThreadMain — exiting (total_frames={})", total_submitted);
 }
 
 // ---- Playback control ----
