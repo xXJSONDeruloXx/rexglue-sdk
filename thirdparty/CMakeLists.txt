@@ -712,6 +712,7 @@ set(FFMPEG_AVFORMAT_SOURCES
     ${FFMPEG_DIR}/libavformat/url.c
     ${FFMPEG_DIR}/libavformat/crypto.c
     ${FFMPEG_DIR}/libavformat/metadata.c
+    ${FFMPEG_DIR}/libavformat/avlanguage.c
     ${FFMPEG_DIR}/libavformat/subtitles.c
     ${FFMPEG_DIR}/libavformat/dump.c
     ${FFMPEG_DIR}/libavformat/apetag.c
