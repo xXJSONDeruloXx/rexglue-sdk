@@ -112,6 +112,11 @@ class XmpApp : public system::xam::App {
   void OnStateChanged();
   Playlist* LookupPlaylistByStoragePtr(uint32_t storage_ptr) const;
 
+  // AVFormatContext* for the currently playing song (opaque to avoid C include in header).
+  // Protected by playback_mutex_ for close — both StopPlayback and the playback thread
+  // may try to close it; the mutex ensures only one wins.
+  void* playback_fmt_ctx_ = nullptr;
+
   State state_;
   PlaybackClient playback_client_;
   PlaybackMode playback_mode_;
