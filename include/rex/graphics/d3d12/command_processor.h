@@ -75,6 +75,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  bool DebugAwaitAllQueueOperationsCompletion() { return AwaitAllQueueOperationsCompletion(); }
 
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was

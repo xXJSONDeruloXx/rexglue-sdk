@@ -38,6 +38,7 @@ class D3D12SharedMemory : public SharedMemory {
 
   ID3D12Resource* GetBuffer() const { return buffer_; }
   D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const { return buffer_gpu_address_; }
+  memory::Memory& GetGuestMemory() const { return memory(); }
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();

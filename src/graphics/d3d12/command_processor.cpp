@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <string>
 #include <utility>
 
 #include <rex/assert.h>
@@ -47,7 +49,77 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// DEBUG: Override swap texture SRV component mapping to diagnose color issues.
+// 0 = default (from game), 1 = force RGBA identity, 2 = force BGRA (R/B swap),
+// 3 = alpha-as-blue test (R,G,A,1), 4 = BGRX test (B,G,R,1)
+REXCVAR_DEFINE_INT32(debug_swap_srv_mapping, 0, "GPU/D3D12",
+                     "Override swap texture SRV component mapping for color debugging")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(debug_swap_texture_dump_once, false, "GPU/D3D12",
+                    "Dump frontbuffer guest bytes and loaded host texture bytes on next IssueSwap")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
+
+// --- DEBUG helpers for IssueSwap instrumentation ---
+static std::string DebugTextureFormatName(xenos::TextureFormat fmt) {
+  switch (fmt) {
+    case xenos::TextureFormat::k_8_8_8_8: return "k_8_8_8_8";
+    case xenos::TextureFormat::k_2_10_10_10: return "k_2_10_10_10";
+    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16: return "k_2_10_10_10_AS_16_16_16_16";
+    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16: return "k_8_8_8_8_AS_16_16_16_16";
+    case xenos::TextureFormat::k_8_8_8_8_GAMMA_EDRAM: return "k_8_8_8_8_GAMMA_EDRAM";
+    case xenos::TextureFormat::k_2_10_10_10_FLOAT_EDRAM: return "k_2_10_10_10_FLOAT_EDRAM";
+    case xenos::TextureFormat::k_8_8_8_8_A: return "k_8_8_8_8_A";
+    default: {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "(idx%d)", static_cast<uint32_t>(fmt));
+      return std::string(buf);
+    }
+  }
+}
+
+static std::string DebugDXGIFormatName(DXGI_FORMAT fmt) {
+  switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8";
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8";
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16F";
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return "R32G32B32A32F";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2";
+    case DXGI_FORMAT_R32G32_FLOAT: return "R32G32F";
+    case DXGI_FORMAT_R8G8_UNORM: return "R8G8";
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "R8G8B8A8_TYPELESS";
+    case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "R10G10B10A2_TYPELESS";
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return "R8G8B8A8_SNORM";
+    default: {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "(0x%04X)", static_cast<uint32_t>(fmt));
+      return std::string(buf);
+    }
+  }
+}
+
+static void DebugFormatSRVMapping(char buf[64], uint32_t mapping) {
+  // Strip the always-set bit for readability
+  mapping &= ~D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+  static const char ch[] = "RGBA";
+  for (uint32_t i = 0; i < 4; i++) {
+    uint32_t comp = (mapping >> (3 * i)) & 0x7;
+    buf[i * 2] = ch[comp > 3 ? 3 : comp];
+    buf[i * 2 + 1] = (i < 3) ? ',' : 0;
+  }
+}
+
+static uint32_t DebugMakeSRVMapping(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+  return (r | (g << 3) | (b << 6) | (a << 9)) |
+         D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+}
+
+// --- end DEBUG helpers ---
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1953,6 +2025,146 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+
+  // DEBUG: Log full swap path parameters for color diagnosis
+  {
+    char srv_map_buf[64];
+    DebugFormatSRVMapping(srv_map_buf, swap_texture_srv_desc.Shader4ComponentMapping);
+    REXGPU_INFO(
+        "IssueSwap: frontbuffer={:08X} {}x{} "
+        "format={} resource_format={} {}x{} "
+        "srv_format={} srv_mapping={} (raw={:08X}) "
+        "unscaled={}x{}",
+        frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+        DebugTextureFormatName(frontbuffer_format),
+        DebugDXGIFormatName(swap_texture_desc.Format),
+        swap_texture_desc.Width, swap_texture_desc.Height,
+        DebugDXGIFormatName(swap_texture_srv_desc.Format),
+        srv_map_buf, swap_texture_srv_desc.Shader4ComponentMapping,
+        frontbuffer_width_unscaled, frontbuffer_height_unscaled);
+  }
+
+  // One-shot diagnostic dump: compare guest memory bytes after resolve with the
+  // bytes loaded into the host swap texture.
+  {
+    static bool dump_done = false;
+    if (REXCVAR_GET(debug_swap_texture_dump_once) && !dump_done) {
+      dump_done = true;
+
+      auto log_pixels = [](const char* tag, const uint8_t* bytes, uint32_t pixel_count,
+                           uint32_t row_pitch) {
+        std::ostringstream os;
+        os << tag << ":";
+        for (uint32_t i = 0; i < pixel_count; ++i) {
+          const uint8_t* p = bytes + i * 4;
+          uint32_t packed = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+                            (uint32_t(p[3]) << 24);
+          os << " p" << i << "=[" << std::hex << std::uppercase
+             << int(p[0]) << "," << int(p[1]) << "," << int(p[2]) << "," << int(p[3])
+             << "] pack=0x" << packed;
+        }
+        os << std::dec << " row_pitch=" << row_pitch;
+        REXGPU_WARN("{}", os.str());
+      };
+
+      if (frontbuffer_ptr && memory_) {
+        const uint8_t* guest_fb = reinterpret_cast<const uint8_t*>(memory_->TranslatePhysical(frontbuffer_ptr));
+        if (guest_fb) {
+          log_pixels("IssueSwap guest frontbuffer bytes", guest_fb, 4, frontbuffer_width * 4);
+        } else {
+          REXGPU_WARN("IssueSwap guest frontbuffer bytes: translate failed for {:08X}", frontbuffer_ptr);
+        }
+      }
+
+      const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+      ID3D12Device* device = provider.GetDevice();
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+      UINT footprint_rows = 0;
+      UINT64 footprint_row_size = 0;
+      UINT64 footprint_total_size = 0;
+      device->GetCopyableFootprints(&swap_texture_desc, 0, 1, 0, &footprint, &footprint_rows,
+                                    &footprint_row_size, &footprint_total_size);
+
+      D3D12_RESOURCE_DESC readback_desc;
+      ui::d3d12::util::FillBufferResourceDesc(readback_desc, footprint_total_size,
+                                              D3D12_RESOURCE_FLAG_NONE);
+      ID3D12Resource* readback_buffer = nullptr;
+      if (SUCCEEDED(device->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+              &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+              IID_PPV_ARGS(&readback_buffer)))) {
+        PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE);
+        SubmitBarriers();
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = swap_texture_resource;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = readback_buffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        UINT dump_width = std::min<UINT>(4, UINT(swap_texture_desc.Width));
+        D3D12_BOX box = {0u, 0u, 0u, dump_width, 1u, 1u};
+        deferred_command_list_.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+
+        PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        SubmitBarriers();
+
+        if (AwaitAllQueueOperationsCompletion()) {
+          D3D12_RANGE read_range = {0, size_t(footprint_total_size)};
+          void* mapped = nullptr;
+          if (SUCCEEDED(readback_buffer->Map(0, &read_range, &mapped))) {
+            log_pixels("IssueSwap host swap texture bytes", reinterpret_cast<const uint8_t*>(mapped), 4,
+                       footprint.Footprint.RowPitch);
+            D3D12_RANGE write_range = {};
+            readback_buffer->Unmap(0, &write_range);
+          } else {
+            REXGPU_WARN("IssueSwap host swap texture bytes: map failed");
+          }
+        } else {
+          REXGPU_WARN("IssueSwap host swap texture bytes: GPU wait failed");
+        }
+        readback_buffer->Release();
+      } else {
+        REXGPU_WARN("IssueSwap host swap texture bytes: failed to create readback buffer");
+      }
+    }
+  }
+
+  // DEBUG: Apply swap SRV mapping override
+  int32_t debug_mapping = REXCVAR_GET(debug_swap_srv_mapping);
+  if (debug_mapping > 0) {
+    uint32_t override_mapping = 0;
+    switch (debug_mapping) {
+      case 1:  // RGBA identity
+        override_mapping = DebugMakeSRVMapping(0, 1, 2, 3);
+        break;
+      case 2:  // BGRA (R/B swap)
+        override_mapping = DebugMakeSRVMapping(2, 1, 0, 3);
+        break;
+      case 3:  // alpha-as-blue test (R,G,A,1)
+        override_mapping = DebugMakeSRVMapping(0, 1, 3, 3);
+        break;
+      case 4:  // BGRX (B,G,R,1)
+        override_mapping = DebugMakeSRVMapping(2, 1, 0, 1);
+        break;
+      default:
+        override_mapping = 0;
+        break;
+    }
+    if (override_mapping) {
+      char old_map_buf[64], new_map_buf[64];
+      DebugFormatSRVMapping(old_map_buf, swap_texture_srv_desc.Shader4ComponentMapping);
+      DebugFormatSRVMapping(new_map_buf, override_mapping);
+      REXGPU_WARN("IssueSwap: DEBUG swap SRV mapping override: {} -> {} (mode={})",
+                  old_map_buf, new_map_buf, debug_mapping);
+      swap_texture_srv_desc.Shader4ComponentMapping = override_mapping;
+    }
+  }
+
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
   // from the swap packet, scaled proportionally to the actual source texture.
@@ -2191,6 +2403,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         uint32_t group_count_x = (guest_output_width + 15) / 16;
         uint32_t group_count_y = (guest_output_height + 7) / 8;
         deferred_command_list_.D3DDispatch(group_count_x, group_count_y, 1);
+
+        // DEBUG: Log apply-gamma dispatch details
+        {
+          const char* gamma_type = use_pwl_gamma_ramp ? "PWL" : "TABLE";
+          const char* fxaa_type = use_fxaa ? "FXAA" : "none";
+          REXGPU_INFO(
+              "IssueSwap: apply-gamma dispatched {} {} output={}x{} groups={}x{} "
+              "uav_format={} guest_output_format={}",
+              gamma_type, fxaa_type,
+              guest_output_width, guest_output_height,
+              group_count_x, group_count_y,
+              DebugDXGIFormatName(apply_gamma_dest_uav_desc.Format),
+              DebugDXGIFormatName(ui::d3d12::D3D12Presenter::kGuestOutputFormat));
+        }
 
         // Apply FXAA.
         if (use_fxaa) {

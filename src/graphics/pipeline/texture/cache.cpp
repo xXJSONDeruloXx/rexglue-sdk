@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
@@ -47,6 +49,20 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
 
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(debug_log_suspect_texture_swizzles_once, false, "GPU",
+                    "Log fetch/swizzle info once for suspect small k_8_8_8_8 textures")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(debug_suspect_texture_swizzle_override, 0, "GPU",
+                     "Override swizzle for suspect Burnout UI/logo k_8_8_8_8 textures only.\n"
+                     " 0 = disabled\n"
+                     " 1 = RGBA\n"
+                     " 2 = BGRA\n"
+                     " 3 = ARGB\n"
+                     " 4 = ABGR\n"
+                     " 5 = RBGA\n"
+                     " 6 = BRGA")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
@@ -499,7 +515,86 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       continue;
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
-    binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    uint32_t host_format_swizzle = GetHostFormatSwizzle(binding.key);
+    binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, host_format_swizzle);
+
+    auto make_swizzle_str = [](uint32_t swizzle) {
+      char chars[4] = {'?', '?', '?', '?'};
+      for (uint32_t i = 0; i < 4; ++i) {
+        switch ((swizzle >> (3 * i)) & 0b111) {
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_R:
+            chars[i] = 'R';
+            break;
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_G:
+            chars[i] = 'G';
+            break;
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_B:
+            chars[i] = 'B';
+            break;
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_A:
+            chars[i] = 'A';
+            break;
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_0:
+            chars[i] = '0';
+            break;
+          case xenos::XE_GPU_TEXTURE_SWIZZLE_1:
+            chars[i] = '1';
+            break;
+          default:
+            chars[i] = '?';
+            break;
+        }
+      }
+      return std::string(chars, 4);
+    };
+    uint32_t base_guest_address = binding.key.base_page << 12;
+    bool suspect_page = base_guest_address == 0x1EE66000 || base_guest_address == 0x0A80F000 ||
+                        base_guest_address == 0x0A820000 || base_guest_address == 0x0A7CE000;
+    if (suspect_page) {
+      switch (REXCVAR_GET(debug_suspect_texture_swizzle_override)) {
+        case 1:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, G, B, A);
+          break;
+        case 2:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A);
+          break;
+        case 3:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(A, R, G, B);
+          break;
+        case 4:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(A, B, G, R);
+          break;
+        case 5:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, B, G, A);
+          break;
+        case 6:
+          binding.host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(B, R, G, A);
+          break;
+        default:
+          break;
+      }
+    }
+    {
+      static std::unordered_set<uint32_t> logged_pages;
+      if (REXCVAR_GET(debug_log_suspect_texture_swizzles_once) && suspect_page &&
+          !logged_pages.contains(base_guest_address)) {
+        logged_pages.insert(base_guest_address);
+        std::ostringstream os;
+        os << "TextureSwizzle fetch=" << index << " addr=0x" << std::hex << std::uppercase
+           << base_guest_address << " raw=[" << fetch.dword_0 << ',' << fetch.dword_1 << ','
+           << fetch.dword_2 << ',' << fetch.dword_3 << ',' << fetch.dword_4 << ','
+           << fetch.dword_5 << ']' << " guest_format_idx=" << std::dec
+           << int(binding.key.format) << " size=" << binding.key.GetWidth() << 'x'
+           << binding.key.GetHeight() << " guest_swizzle=" << make_swizzle_str(fetch.swizzle)
+           << " host_format_swizzle=" << make_swizzle_str(host_format_swizzle)
+           << " combined_swizzle=" << make_swizzle_str(binding.host_swizzle)
+           << " override_mode=" << REXCVAR_GET(debug_suspect_texture_swizzle_override)
+           << " signed_separate=" << int(binding.key.signed_separate)
+           << " tiled=" << int(binding.key.tiled)
+           << " packed_mips=" << int(binding.key.packed_mips);
+        REXGPU_WARN("{}", os.str());
+      }
+    }
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for

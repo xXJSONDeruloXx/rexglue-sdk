@@ -15,14 +15,18 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
@@ -33,6 +37,13 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
+
+REXCVAR_DEFINE_BOOL(debug_dump_small_rgba_textures_once, false, "GPU/D3D12",
+                    "Dump guest/load/host bytes for small k_8_8_8_8 textures once per page")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(debug_dump_small_rgba_textures_max, 12, "GPU/D3D12",
+                     "Maximum number of small k_8_8_8_8 texture pages to dump per run")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1407,6 +1418,97 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
     *height_unscaled_out = key.GetHeight();
   }
   format_out = key.format;
+
+  // DEBUG: Log RequestSwapTexture parameters (one-time)
+  {
+    static bool swap_texture_logged = false;
+    if (!swap_texture_logged) {
+      swap_texture_logged = true;
+
+      // Format names
+      const char* fmt_name = "(other)";
+      switch (key.format) {
+        case xenos::TextureFormat::k_8_8_8_8: fmt_name = "k_8_8_8_8"; break;
+        case xenos::TextureFormat::k_2_10_10_10: fmt_name = "k_2_10_10_10"; break;
+        case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16: fmt_name = "k_2_10_10_10_AS_16_16_16_16"; break;
+        case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16: fmt_name = "k_8_8_8_8_AS_16_16_16_16"; break;
+        case xenos::TextureFormat::k_8_8_8_8_GAMMA_EDRAM: fmt_name = "k_8_8_8_8_GAMMA_EDRAM"; break;
+        default: break;
+      }
+
+      const char* res_fmt_name = "(other)";
+      switch (texture->resource()->GetDesc().Format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: res_fmt_name = "R8G8B8A8"; break;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: res_fmt_name = "R8G8B8A8_TYPELESS"; break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM: res_fmt_name = "R16G16B16A16_UNORM"; break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: res_fmt_name = "R16G16B16A16_FLOAT"; break;
+        case DXGI_FORMAT_R10G10B10A2_UNORM: res_fmt_name = "R10G10B10A2_UNORM"; break;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: res_fmt_name = "R10G10B10A2_TYPELESS"; break;
+        default: break;
+      }
+
+      const char* srv_fmt_name = "(other)";
+      switch (srv_desc_out.Format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: srv_fmt_name = "R8G8B8A8"; break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM: srv_fmt_name = "R16G16B16A16"; break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: srv_fmt_name = "R16G16B16A16F"; break;
+        default: break;
+      }
+
+      // DEBUG: Raw texture fetch constant dump
+      REXGPU_INFO(
+          "RequestSwapTexture: RAW fetch constant [0]={:08X} [1]={:08X} [2]={:08X} "
+          "[3]={:08X} [4]={:08X} [5]={:08X}"
+          " format={:d} endian={:d} swizzle_raw=0x{:03X}"
+          " width={:d} height={:d} base_page={:06X}"
+          " type={:d} stacked={:d} tiled={:d} pitch={:d}",
+          fetch.dword_0, fetch.dword_1, fetch.dword_2,
+          fetch.dword_3, fetch.dword_4, fetch.dword_5,
+          static_cast<uint32_t>(fetch.format),
+          static_cast<uint32_t>(fetch.endianness),
+          static_cast<uint32_t>(fetch.swizzle),
+          fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+          static_cast<uint32_t>(fetch.base_address),
+          static_cast<uint32_t>(fetch.type),
+          static_cast<uint32_t>(fetch.stacked),
+          static_cast<uint32_t>(fetch.tiled),
+          static_cast<uint32_t>(fetch.pitch));
+
+      // Swizzle strings
+      uint32_t guest_swizzle = fetch.swizzle;
+      uint32_t host_format_swizzle = GetHostFormatSwizzle(key);
+      uint32_t combined_swizzle =
+          GuestToHostSwizzle(guest_swizzle, host_format_swizzle) |
+          D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+
+      auto makeSwizzleStr = [](uint32_t mapping, char buf[64]) {
+        mapping &= ~D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        static const char ch[] = "RGBA";
+        for (uint32_t i = 0; i < 4; i++) {
+          uint32_t comp = (mapping >> (3 * i)) & 0x7;
+          buf[i * 2] = ch[comp > 3 ? 3 : comp];
+          buf[i * 2 + 1] = (i < 3) ? ',' : 0;
+        }
+      };
+      char guest_buf[64], host_buf[64], combined_buf[64];
+      makeSwizzleStr(guest_swizzle, guest_buf);
+      makeSwizzleStr(host_format_swizzle, host_buf);
+      makeSwizzleStr(combined_swizzle, combined_buf);
+
+      REXGPU_INFO(
+          "RequestSwapTexture: format={} (idx={}) {}x{} "
+          "resource_format={} srv_format={} "
+          "guest_swizzle={} host_format_swizzle={} combined={} "
+          "page={:06X} scaled={}",
+          fmt_name, static_cast<uint32_t>(key.format),
+          key.GetWidth(), key.GetHeight(),
+          res_fmt_name, srv_fmt_name,
+          guest_buf, host_buf, combined_buf,
+          static_cast<uint32_t>(key.base_page),
+          key.scaled_resolve ? "yes" : "no");
+    }
+  }
+
   return texture_resource;
 }
 
@@ -1927,6 +2029,89 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
       location_dest.SubresourceIndex += texture_level_count;
       location_source.PlacedFootprint.Offset += host_slice_size;
+    }
+  }
+
+  {
+    static std::unordered_set<uint32_t> dumped_pages;
+    bool should_dump = REXCVAR_GET(debug_dump_small_rgba_textures_once) &&
+                       !texture_resolution_scaled && guest_format == xenos::TextureFormat::k_8_8_8_8 &&
+                       width <= 512 && height <= 512 && level_first == 0 &&
+                       dumped_pages.size() < size_t(std::max(0, REXCVAR_GET(debug_dump_small_rgba_textures_max)));
+    uint32_t base_guest_address = texture_key.base_page << 12;
+    if (should_dump && !dumped_pages.contains(base_guest_address)) {
+      dumped_pages.insert(base_guest_address);
+
+      auto log_bytes = [](const char* tag, uint32_t guest_address, const uint8_t* bytes,
+                          uint32_t count, uint32_t row_pitch) {
+        std::ostringstream os;
+        os << tag << " addr=0x" << std::hex << std::uppercase << guest_address;
+        for (uint32_t i = 0; i < count; ++i) {
+          const uint8_t* p = bytes + i * 4;
+          uint32_t packed = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+                            (uint32_t(p[3]) << 24);
+          os << " p" << std::dec << i << "=[" << std::hex << std::uppercase << int(p[0]) << ","
+             << int(p[1]) << "," << int(p[2]) << "," << int(p[3]) << "] pack=0x" << packed;
+        }
+        os << std::dec << " row_pitch=" << row_pitch;
+        REXGPU_WARN("{}", os.str());
+      };
+
+      memory::Memory& guest_memory = static_cast<D3D12SharedMemory&>(shared_memory()).GetGuestMemory();
+      const uint8_t* guest_bytes = reinterpret_cast<const uint8_t*>(guest_memory.TranslatePhysical(base_guest_address));
+      if (guest_bytes) {
+        log_bytes("TextureDump guest tiled bytes", base_guest_address, guest_bytes, 8,
+                  guest_layout.base.row_pitch_bytes);
+
+        uint32_t untiled_width = std::min<uint32_t>(width, 8);
+        uint32_t untiled_height = std::min<uint32_t>(height, 2);
+        std::array<uint8_t, 8 * 2 * 4> untiled_bytes = {};
+        if (texture_key.tiled) {
+          texture_conversion::UntileInfo untile_info;
+          untile_info.offset_x = 0;
+          untile_info.offset_y = 0;
+          untile_info.width = untiled_width;
+          untile_info.height = untiled_height;
+          untile_info.input_pitch = guest_layout.base.row_pitch_bytes / bytes_per_block;
+          untile_info.output_pitch = untiled_width;
+          untile_info.input_format_info = guest_format_info;
+          untile_info.output_format_info = guest_format_info;
+          untile_info.copy_callback = [endianness = texture_key.endianness](void* output,
+                                                                            const void* input,
+                                                                            size_t length) {
+            texture_conversion::CopySwapBlock(endianness, output, input, length);
+          };
+          texture_conversion::Untile(untiled_bytes.data(), guest_bytes, &untile_info);
+        } else {
+          for (uint32_t row = 0; row < untiled_height; ++row) {
+            for (uint32_t col = 0; col < untiled_width; ++col) {
+              texture_conversion::CopySwapBlock(
+                  texture_key.endianness, untiled_bytes.data() + ((row * untiled_width + col) * 4),
+                  guest_bytes + row * guest_layout.base.row_pitch_bytes + col * 4, 4);
+            }
+          }
+        }
+        log_bytes("TextureDump guest untiled row0", base_guest_address, untiled_bytes.data(),
+                  untiled_width, untiled_width * 4);
+        if (untiled_height > 1) {
+          log_bytes("TextureDump guest untiled row1", base_guest_address,
+                    untiled_bytes.data() + untiled_width * 4, untiled_width, untiled_width * 4);
+        }
+      }
+
+      std::ostringstream os;
+      os << "TextureDump metadata addr=0x" << std::hex << std::uppercase << base_guest_address
+         << " guest_format_idx=" << std::dec << int(guest_format)
+         << " width=" << width << " height=" << height
+         << " scaled=" << int(texture_resolution_scaled)
+         << " tiled=" << int(texture_key.tiled)
+         << " endian=" << int(texture_key.endianness)
+         << " load_shader=" << int(load_shader)
+         << " guest_row_pitch=" << guest_layout.base.row_pitch_bytes
+         << " host_row_pitch=" << host_slice_layout_base.Footprint.RowPitch
+         << " host_offset=" << host_slice_layout_base.Offset
+         << " copy_buffer_size=" << copy_buffer_size;
+      REXGPU_WARN("{}", os.str());
     }
   }
 
