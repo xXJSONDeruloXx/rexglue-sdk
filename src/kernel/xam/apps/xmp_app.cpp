@@ -362,17 +362,27 @@ void XmpApp::PlaybackThreadMain() {
     }
 
     // Open the file using FFmpeg
+    REXKRNL_INFO("XMP: Calling avformat_open_input('{}')", host_path);
     AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_open_input(&fmt_ctx, host_path.c_str(), nullptr, nullptr) != 0) {
-      REXKRNL_WARN("XMP: Failed to open file '{}' for playback", host_path);
+    int ret = avformat_open_input(&fmt_ctx, host_path.c_str(), nullptr, nullptr);
+    if (ret != 0) {
+      char errbuf[128];
+      av_strerror(ret, errbuf, sizeof(errbuf));
+      REXKRNL_WARN("XMP: avformat_open_input failed for '{}': {} ({})", host_path, errbuf, ret);
       break;
     }
+    REXKRNL_INFO("XMP: avformat_open_input succeeded");
 
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-      REXKRNL_WARN("XMP: Failed to find stream info for '{}'", host_path);
+    REXKRNL_INFO("XMP: Calling avformat_find_stream_info");
+    ret = avformat_find_stream_info(fmt_ctx, nullptr);
+    if (ret < 0) {
+      char errbuf[128];
+      av_strerror(ret, errbuf, sizeof(errbuf));
+      REXKRNL_WARN("XMP: avformat_find_stream_info failed for '{}': {} ({})", host_path, errbuf, ret);
       avformat_close_input(&fmt_ctx);
       break;
     }
+    REXKRNL_INFO("XMP: avformat_find_stream_info succeeded ({} streams)", (int)fmt_ctx->nb_streams);
 
     // Find the audio stream
     int audio_stream_index = -1;
