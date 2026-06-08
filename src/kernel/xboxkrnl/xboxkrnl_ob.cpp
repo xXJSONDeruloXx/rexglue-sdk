@@ -177,7 +177,7 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
   auto target = rex::string::utf8_canonicalize_guest_path(
       util::TranslateAnsiPath(REX_KERNEL_MEMORY(), target_ptr));
 
-  if (rex::string::utf8_starts_with(path, u8"\\??\\")) {
+  if (rex::string::utf8_starts_with(path, "\??\\")) {
     path = path.substr(4);  // Strip the full qualifier
   }
 
