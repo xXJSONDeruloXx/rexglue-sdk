@@ -278,6 +278,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
   register_file_[r] = value;
 
   if (r >= XmaRegister::Context0Kick && r <= XmaRegister::Context9Kick) {
+    REXAPU_INFO("XMA: Kick register {:#06x} value={:#010x}", r * 4, value);
     // Context kick command.
     // This will kick off the given hardware contexts.
     // Basically, this kicks the SPU and says "hey, decode that audio!"
@@ -290,6 +291,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+
         context.Enable();
       }
     }
