@@ -309,6 +309,9 @@ if(REXGLUE_USE_VULKAN)
     set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(spirv-tools)
     target_compile_options(SPIRV-Tools-static PRIVATE -w)
+    target_compile_options(SPIRV-Tools-shared PRIVATE -w)
+    target_compile_options(SPIRV-Tools-opt PRIVATE -w)
+    target_compile_options(SPIRV-Tools-reduce PRIVATE -w)
 
     # glslang/SPIRV - SPIR-V code generation for shader translation
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)

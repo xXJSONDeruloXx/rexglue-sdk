@@ -135,6 +135,7 @@ if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
         Shcore
+        dxgi
     )
 else()
     find_package(PkgConfig REQUIRED)

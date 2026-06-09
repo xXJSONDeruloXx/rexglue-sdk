@@ -102,12 +102,12 @@ endif()
 # Global compile options
 add_compile_options(
     -fno-strict-aliasing
-    -ffp-model=strict
+    $<$<NOT:$<BOOL:${WIN32}>>:-ffp-model=strict>
     $<$<CONFIG:DEBUG>:-g>
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
     $<$<CONFIG:RELEASE>:-DNDEBUG>
-    -fno-char8_t
+    $<$<NOT:$<BOOL:${WIN32}>>:-fno-char8_t>
 )
 
 # Platform detection (supports AMD64 and ARM64)
