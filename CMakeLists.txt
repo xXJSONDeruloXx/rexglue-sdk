@@ -91,14 +91,17 @@ if(NOT WIN32)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         # Large code model on x86_64 for linking with very large recompiled executables (35MB+)
         add_compile_options(-mcmodel=large)
-        # SSSE3 required for _mm_shuffle_epi8 and other intrinsics
-        add_compile_options(-mssse3)
     else()
         # Small code model for other architectures (ARM64, etc.)
         add_compile_options(-mcmodel=small)
     endif()
     # Position-independent code for all targets
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# SSSE3 required for _mm_shuffle_epi8 and other intrinsics (x86_64 only)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    add_compile_options(-mssse3)
 endif()
 
 # Global compile options
