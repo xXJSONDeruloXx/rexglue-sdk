@@ -1,0 +1,112 @@
+name: SDK Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+            cc: clang-cl
+            cxx: clang-cl
+            d3d12: ON
+            vulkan: OFF
+            out_suffix: win-amd64
+          - platform: linux
+            runner: ubuntu-24.04
+            cc: clang-20
+            cxx: clang++-20
+            d3d12: OFF
+            vulkan: ON
+            out_suffix: linux-amd64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout burnout-revenge branch
+        run: git checkout burnout-revenge -- .
+
+      - name: Install deps (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y ninja-build libgtk-3-dev libx11-xcb-dev
+
+      - name: Install deps (Windows)
+        if: matrix.platform == 'windows'
+        run: choco install llvm cmake ninja -y
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build \
+            -G "Ninja" \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREXGLUE_USE_D3D12=${{ matrix.d3d12 }} \
+            -DREXGLUE_USE_VULKAN=${{ matrix.vulkan }} \
+            -DREXGLUE_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel ${{ (matrix.platform == 'windows') && 4 || 4 }}
+
+      - name: Package
+        shell: bash
+        run: |
+          cd build
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          NAME="rexglue-sdk-${VERSION}-${{ matrix.out_suffix }}"
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            mkdir -p "$NAME"
+            cp -r out "$NAME/"
+            cp -r include "$NAME/"
+            cp -r lib "$NAME/" 2>/dev/null || true
+            cp -r bin "$NAME/" 2>/dev/null || true
+            zip -r "../${NAME}.zip" "$NAME"
+          else
+            mkdir -p "$NAME"
+            cp -r out "$NAME/"
+            cp -r include "$NAME/"
+            cp -r lib "$NAME/" 2>/dev/null || true
+            tar -czvf "../${NAME}.tar.gz" "$NAME"
+          fi
+          echo "ASSET=../${NAME}.${{ matrix.platform == 'windows' && 'zip' || 'tar.gz' }}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-${{ matrix.out_suffix }}
+          path: "*.zip"
+          if-no-files-found: warn
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-*
+          path: assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          files: assets/*
+          generate_release_notes: true
