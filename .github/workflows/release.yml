@@ -24,7 +24,7 @@ jobs:
             vulkan: OFF
             out_suffix: win-amd64
           - platform: linux
-            runner: ubuntu-24.04
+            runner: ubuntu-latest
             cc: clang-20
             cxx: clang++-20
             d3d12: OFF
@@ -55,6 +55,7 @@ jobs:
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=install \
             -DREXGLUE_USE_D3D12=${{ matrix.d3d12 }} \
             -DREXGLUE_USE_VULKAN=${{ matrix.vulkan }} \
             -DREXGLUE_BUILD_TESTS=OFF
@@ -62,27 +63,20 @@ jobs:
       - name: Build
         run: cmake --build build --parallel ${{ (matrix.platform == 'windows') && 4 || 4 }}
 
+      - name: Install
+        run: cmake --install build --config Release
+
       - name: Package
         shell: bash
         run: |
-          cd build
-          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "dev")
           NAME="rexglue-sdk-${VERSION}-${{ matrix.out_suffix }}"
+          cp -r install "$NAME"
           if [ "${{ matrix.platform }}" = "windows" ]; then
-            mkdir -p "$NAME"
-            cp -r out "$NAME/"
-            cp -r include "$NAME/"
-            cp -r lib "$NAME/" 2>/dev/null || true
-            cp -r bin "$NAME/" 2>/dev/null || true
-            zip -r "../${NAME}.zip" "$NAME"
+            zip -r "${NAME}.zip" "$NAME"
           else
-            mkdir -p "$NAME"
-            cp -r out "$NAME/"
-            cp -r include "$NAME/"
-            cp -r lib "$NAME/" 2>/dev/null || true
-            tar -czvf "../${NAME}.tar.gz" "$NAME"
+            tar -czf "${NAME}.tar.gz" "$NAME"
           fi
-          echo "ASSET=../${NAME}.${{ matrix.platform == 'windows' && 'zip' || 'tar.gz' }}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -95,6 +89,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: burnout-revenge
+
       - uses: actions/download-artifact@v4
         with:
           pattern: sdk-*
@@ -105,11 +103,11 @@ jobs:
         run: |
           TAG="sdk-$(date +%Y%m%d)-${{ github.sha }}"
           echo "SDK_TAG=$TAG" >> $GITHUB_ENV
-          git tag "$TAG" 2>/dev/null || true
 
       - uses: softprops/action-gh-release@v2
         with:
           name: ${{ env.SDK_TAG }}
           tag_name: ${{ env.SDK_TAG }}
           files: assets/*
+          prerelease: true
           generate_release_notes: true
