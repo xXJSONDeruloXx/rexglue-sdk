@@ -2,7 +2,7 @@ name: SDK Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [burnout-revenge]
   workflow_dispatch:
 
 permissions:
@@ -35,10 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
-
-      - name: Checkout burnout-revenge branch
-        run: git checkout burnout-revenge -- .
+          ref: burnout-revenge
 
       - name: Install deps (Linux)
         if: matrix.platform == 'linux'
@@ -104,9 +101,15 @@ jobs:
           path: assets
           merge-multiple: true
 
+      - name: Create tag
+        run: |
+          TAG="sdk-$(date +%Y%m%d)-${{ github.sha }}"
+          echo "SDK_TAG=$TAG" >> $GITHUB_ENV
+          git tag "$TAG" 2>/dev/null || true
+
       - uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
+          name: ${{ env.SDK_TAG }}
+          tag_name: ${{ env.SDK_TAG }}
           files: assets/*
           generate_release_notes: true
