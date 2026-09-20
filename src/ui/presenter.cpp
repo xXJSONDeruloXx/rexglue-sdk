@@ -1588,6 +1588,9 @@ void Presenter::WaitForUITickFromUIThread() {
     // possible as they should be fulfilled as early as possible.
     if (dxgi_ui_tick_force_requested_) {
       dxgi_ui_tick_force_requested_ = false;
+      // This forced paint also satisfies the current monitor tick. Keep the
+      // vblank-driven UI thread from presenting the same guest frame again.
+      dxgi_ui_tick_last_draw_ = dxgi_ui_tick_last_vblank_;
       return;
     }
     if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
