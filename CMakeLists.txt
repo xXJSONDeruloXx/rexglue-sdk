@@ -133,16 +133,27 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
     add_compile_options(-mssse3)
 endif()
 
-# Global compile options
-add_compile_options(
-    -fno-strict-aliasing
-    -ffp-model=strict
-    $<$<CONFIG:DEBUG>:-g>
-    $<$<CONFIG:DEBUG>:-O0>
-    $<$<CONFIG:RELEASE>:-O3>
-    $<$<CONFIG:RELEASE>:-DNDEBUG>
-    -fno-char8_t
-)
+# Global compile options. clang-cl uses the MSVC driver spelling for floating-
+# point behavior, and CMake already supplies configuration-specific debug and
+# optimization flags for its frontend. Keep GNU-style options for clang++.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
+   CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options(
+        -fno-strict-aliasing
+        "$<$<COMPILE_LANGUAGE:CXX>:/fp:strict>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/clang:-fno-char8_t>"
+    )
+else()
+    add_compile_options(
+        -fno-strict-aliasing
+        -ffp-model=strict
+        $<$<CONFIG:DEBUG>:-g>
+        $<$<CONFIG:DEBUG>:-O0>
+        $<$<CONFIG:RELEASE>:-O3>
+        $<$<CONFIG:RELEASE>:-DNDEBUG>
+        -fno-char8_t
+    )
+endif()
 
 # Platform detection (supports AMD64 and ARM64)
 set(REX_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
