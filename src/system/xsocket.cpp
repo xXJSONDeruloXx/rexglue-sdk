@@ -47,9 +47,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   type_ = type;
   proto_ = proto;
 
-  if (proto == Protocol::IPPROTO_VDP) {
+  if (proto == Protocol::X_IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    proto = Protocol::X_IPPROTO_UDP;
   }
 
   native_handle_ = socket(af, type, proto);
@@ -61,7 +61,12 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 }
 
 X_STATUS XSocket::Close() {
+  if (native_handle_ == uint64_t(-1)) {
+    return X_STATUS_SUCCESS;
+  }
+
   int ret = rex::net::socket_close(native_handle_);
+  native_handle_ = -1;
   if (ret != 0) {
     return X_STATUS_UNSUCCESSFUL;
   }

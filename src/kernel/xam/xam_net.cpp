@@ -14,6 +14,10 @@
 
 #include <cstring>
 
+#if REX_PLATFORM_MAC
+#include <sys/select.h>
+#endif
+
 #include <rex/chrono/clock.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
@@ -33,7 +37,7 @@
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -373,7 +377,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
 }
 
 u32 NetDll_WSACreateEvent_entry() {
-  XEvent* ev = new XEvent(REX_KERNEL_STATE());
+  auto ev = object_ref<XEvent>(new XEvent(REX_KERNEL_STATE()));
   ev->Initialize(true, false);
   return ev->handle();
 }
@@ -469,7 +473,7 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
-  rex::string::rex_strcpy(string_out, string_size, "666.666.666.666");
+  rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
@@ -575,13 +579,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
 }
 
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
-  XSocket* socket = new XSocket(REX_KERNEL_STATE());
+  auto socket = object_ref<XSocket>(new XSocket(REX_KERNEL_STATE()));
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
                          XSocket::Protocol((uint32_t)protocol));
 
   if (XFAILED(result)) {
-    socket->Release();
+    socket->ReleaseHandle();
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
@@ -759,7 +763,10 @@ struct host_set {
       }
       // Convert from Xenia -> native
       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
-      assert_not_null(socket);
+      if (!socket) {
+        this->count = i;
+        break;
+      }
       this->sockets[i] = socket;
     }
   }

@@ -7,18 +7,21 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
+#include <string_view>
 #include <unordered_map>
 
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform/env.h>
 
 #include <toml++/toml.hpp>
 
@@ -29,6 +32,10 @@ namespace {
 bool g_finalized = false;
 bool g_lifecycle_override = false;
 std::mutex g_mutex;
+
+// Set once cvar::Init has parsed the command line; later registrations are
+// from runtime-loaded modules and drain pending values.
+std::atomic<bool> g_init_done = false;
 
 // Recursive: FlagRegistrar chain methods re-enter; change callbacks invoked
 // from SetFlagByName must not mutate the registry.
@@ -48,6 +55,18 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
   return index;
 }
 
+// Values that arrived before their cvar was registered; runtime-loaded
+// modules register cvars long after Init/LoadConfig.
+struct PendingValues {
+  std::optional<std::string> cmdline;
+  std::optional<std::string> config;
+};
+
+std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
+  static std::unordered_map<std::string, PendingValues> pending;
+  return pending;
+}
+
 // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
 std::string FlagNameToEnvVar(std::string_view name) {
   std::string result = "REX_";
@@ -55,6 +74,23 @@ std::string FlagNameToEnvVar(std::string_view name) {
     result += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   }
   return result;
+}
+
+enum class ApplyResult { kApplied, kSkipped, kRejected };
+
+ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Source source);
+
+bool Outranks(Source source, const FlagEntry& entry) {
+  return source >= entry.source;
+}
+
+// Unvalidated apply, for the command line and environment paths.
+bool ApplyFromSource(FlagEntry& entry, std::string_view value, Source source) {
+  if (!Outranks(source, entry) || !entry.setter(value)) {
+    return false;
+  }
+  entry.source = source;
+  return true;
 }
 
 // Recursively apply TOML values
@@ -79,10 +115,23 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         continue;
       }
 
-      if (SetFlagByName(full_key, value_str)) {
-        REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
-      } else {
-        REXLOG_WARN("Config: unknown cvar '{}'", full_key);
+      if (GetFlagInfo(full_key) == nullptr) {
+        std::lock_guard lock(GetRegistryMutex());
+        GetPendingValuesStorage()[full_key].config = value_str;
+        REXLOG_DEBUG("Config: '{}' deferred (cvar not yet registered)", full_key);
+        continue;
+      }
+
+      switch (SetFlagFromSource(full_key, value_str, Source::kConfig)) {
+        case ApplyResult::kApplied:
+          REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
+          break;
+        case ApplyResult::kSkipped:
+          REXLOG_DEBUG("Config: {} ignored, already set by a higher-priority source", full_key);
+          break;
+        case ApplyResult::kRejected:
+          REXLOG_WARN("Config: invalid value for cvar '{}'", full_key);
+          break;
       }
     }
   }
@@ -186,6 +235,26 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
   size_t pos = storage.size();
   index[entry.name] = pos;
   storage.push_back(std::move(entry));
+
+  // Late registration: replay pending values in ascending priority.
+  if (g_init_done) {
+    FlagEntry& stored = storage[pos];
+    auto& pending = GetPendingValuesStorage();
+    auto pending_it = pending.find(stored.name);
+    if (pending_it != pending.end() && pending_it->second.config) {
+      ApplyFromSource(stored, *pending_it->second.config, Source::kConfig);
+    }
+    auto env_value = rex::platform::env::get(FlagNameToEnvVar(stored.name));
+    if (env_value.has_value()) {
+      ApplyFromSource(stored, *env_value, Source::kEnvironment);
+    }
+    if (pending_it != pending.end()) {
+      if (pending_it->second.cmdline) {
+        ApplyFromSource(stored, *pending_it->second.cmdline, Source::kCommandLine);
+      }
+      pending.erase(pending_it);
+    }
+  }
   return pos;
 }
 
@@ -224,45 +293,81 @@ void FlagRegistrar::apply_(std::function<void(FlagEntry&)> fn) {
   fn(GetRegistryStorage()[it->second]);
 }
 
-bool SetFlagByName(std::string_view name, std::string_view value) {
+namespace {
+
+ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Source source) {
   std::lock_guard lock(GetRegistryMutex());
   auto it = GetRegistryIndex().find(std::string(name));
   if (it == GetRegistryIndex().end()) {
-    return false;
+    return ApplyResult::kRejected;
   }
 
-  const auto& entry = GetRegistryStorage()[it->second];
+  auto& entry = GetRegistryStorage()[it->second];
 
-  // Check lifecycle
+  if (!Outranks(source, entry)) {
+    return ApplyResult::kSkipped;
+  }
+
   if (!g_lifecycle_override && entry.lifecycle == Lifecycle::kInitOnly && IsFinalized()) {
     REXLOG_WARN("Cannot modify init-only flag '{}' after initialization", name);
-    return false;
+    return ApplyResult::kRejected;
   }
 
-  // Validate constraints
   if (!ValidateConstraints(entry, value)) {
-    return false;
+    return ApplyResult::kRejected;
   }
 
-  bool success = entry.setter(value);
+  if (!entry.setter(value)) {
+    return ApplyResult::kRejected;
+  }
+  entry.source = source;
 
-  // Track pending restart flags
-  if (success && entry.lifecycle == Lifecycle::kRequiresRestart) {
+  if (entry.lifecycle == Lifecycle::kRequiresRestart) {
     MarkPendingRestart(name);
   }
 
-  // Invoke registered callbacks
-  if (success) {
-    auto& callbacks = GetCallbackStorage();
-    auto it = callbacks.find(std::string(name));
-    if (it != callbacks.end()) {
-      for (const auto& callback : it->second) {
-        callback(name, value);
-      }
+  auto& callbacks = GetCallbackStorage();
+  auto callback_it = callbacks.find(std::string(name));
+  if (callback_it != callbacks.end()) {
+    for (const auto& callback : callback_it->second) {
+      callback(name, value);
     }
   }
 
-  return success;
+  return ApplyResult::kApplied;
+}
+
+}  // namespace
+
+bool SetFlagByName(std::string_view name, std::string_view value) {
+  return SetFlagFromSource(name, value, Source::kRuntime) == ApplyResult::kApplied;
+}
+
+bool SetFlagFromCommandLine(std::string_view name, std::string_view value) {
+  return SetFlagFromSource(name, value, Source::kCommandLine) != ApplyResult::kRejected;
+}
+
+bool InvokeCommand(std::string_view name, std::string_view args) {
+  std::function<void(std::string_view)> cb;
+  {
+    std::lock_guard lock(GetRegistryMutex());
+    auto it = GetRegistryIndex().find(std::string(name));
+    if (it == GetRegistryIndex().end()) {
+      return false;
+    }
+    const auto& entry = GetRegistryStorage()[it->second];
+    if (entry.type != FlagType::Command) {
+      return false;
+    }
+    // Copy the callback out from under the lock; GetFlagInfo pointers are
+    // invalidated by registry mutation and a command may touch the registry.
+    cb = entry.command_callback;
+  }
+  if (!cb) {
+    return false;
+  }
+  cb(args);
+  return true;
 }
 
 std::string GetFlagByName(std::string_view name) {
@@ -273,6 +378,15 @@ std::string GetFlagByName(std::string_view name) {
   }
 
   return GetRegistryStorage()[it->second].getter();
+}
+
+Source GetFlagSource(std::string_view name) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) {
+    return Source::kDefault;
+  }
+  return GetRegistryStorage()[it->second].source;
 }
 
 std::vector<std::string> ListFlags() {
@@ -323,7 +437,7 @@ const FlagEntry* GetFlagInfo(std::string_view name) {
 template <>
 bool Query<bool>(std::string_view name) {
   std::string v = GetFlagByName(name);
-  return v == "true" || v == "1" || v == "yes";
+  return rex::string::from_string<bool>(v, false);
 }
 
 template <>
@@ -387,14 +501,16 @@ void ResetToDefault(std::string_view name) {
   if (it == GetRegistryIndex().end()) {
     return;
   }
-  const auto& entry = GetRegistryStorage()[it->second];
+  auto& entry = GetRegistryStorage()[it->second];
   entry.setter(entry.default_value);
+  entry.source = Source::kDefault;
 }
 
 void ResetAllToDefaults() {
   std::lock_guard lock(GetRegistryMutex());
-  for (const auto& entry : GetRegistryStorage()) {
+  for (auto& entry : GetRegistryStorage()) {
     entry.setter(entry.default_value);
+    entry.source = Source::kDefault;
   }
 }
 
@@ -471,11 +587,14 @@ std::vector<std::string> Init(int argc, char** argv) {
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
+          [&entry](int64_t count) {
+            ApplyFromSource(entry, count > 0 ? "true" : "false", Source::kCommandLine);
+          },
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name,
+          [&entry](const std::string& val) { ApplyFromSource(entry, val, Source::kCommandLine); },
           entry.description);
     }
   }
@@ -488,7 +607,33 @@ std::vector<std::string> Init(int argc, char** argv) {
     fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
   }
 
-  return app.remaining();
+  // Stash unrecognized --options for cvars that register later. Supported
+  // forms: --name=value, --name (true), --no-name (false); a separated
+  // "--name value" pair is ambiguous with a positional, so never consumed.
+  std::vector<std::string> positional;
+  for (const auto& arg : app.remaining()) {
+    std::string_view view(arg);
+    if (!view.starts_with("--")) {
+      positional.push_back(arg);
+      continue;
+    }
+    view.remove_prefix(2);
+    std::string name;
+    std::string value = "true";
+    if (auto eq = view.find('='); eq != std::string_view::npos) {
+      name.assign(view.substr(0, eq));
+      value.assign(view.substr(eq + 1));
+    } else if (view.starts_with("no-")) {
+      name.assign(view.substr(3));
+      value = "false";
+    } else {
+      name.assign(view);
+    }
+    std::lock_guard lock(GetRegistryMutex());
+    GetPendingValuesStorage()[name].cmdline = std::move(value);
+  }
+  g_init_done = true;
+  return positional;
 }
 
 void LoadConfig(const std::filesystem::path& config_path) {
@@ -500,7 +645,7 @@ void LoadConfig(const std::filesystem::path& config_path) {
   try {
     auto config = toml::parse_file(config_path.string());
     ApplyTomlTable(config, "");
-    REXLOG_INFO("Loaded config from {}", config_path.string());
+    REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
   }
@@ -508,16 +653,21 @@ void LoadConfig(const std::filesystem::path& config_path) {
 
 void ApplyEnvironment() {
   int count = 0;
-  for (const auto& entry : GetRegistryStorage()) {
+  for (auto& entry : GetRegistryStorage()) {
     std::string env_name = FlagNameToEnvVar(entry.name);
-    const char* env_value = std::getenv(env_name.c_str());
-    if (env_value != nullptr) {
-      if (entry.setter(env_value)) {
-        REXLOG_DEBUG("Env: {} = {} (from {})", entry.name, env_value, env_name);
-        ++count;
-      } else {
-        REXLOG_WARN("Env: failed to parse {} = {}", env_name, env_value);
-      }
+    auto env_value = rex::platform::env::get(env_name);
+    if (!env_value.has_value()) {
+      continue;
+    }
+    if (!Outranks(Source::kEnvironment, entry)) {
+      REXLOG_DEBUG("Env: {} ignored, already set on the command line", entry.name);
+      continue;
+    }
+    if (ApplyFromSource(entry, *env_value, Source::kEnvironment)) {
+      REXLOG_DEBUG("Env: {} = {} (from {})", entry.name, *env_value, env_name);
+      ++count;
+    } else {
+      REXLOG_WARN("Env: failed to parse {} = {}", env_name, *env_value);
     }
   }
 
@@ -529,6 +679,10 @@ void ApplyEnvironment() {
 void FinalizeInit() {
   std::lock_guard lock(g_mutex);
   g_finalized = true;
+  for (const auto& [name, values] : GetPendingValuesStorage()) {
+    (void)values;
+    REXLOG_WARN("Config: unknown cvar '{}'", name);
+  }
   REXLOG_DEBUG("cvar: initialization finalized");
 }
 
@@ -570,6 +724,8 @@ ScopedLifecycleOverride::~ScopedLifecycleOverride() {
 void ResetAllForTesting() {
   ResetAllToDefaults();
   ClearPendingRestartFlags();
+  GetPendingValuesStorage().clear();
+  g_init_done = false;
   g_finalized = false;
 }
 

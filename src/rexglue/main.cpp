@@ -13,23 +13,18 @@
 #include "ui/ui.h"
 
 #include <chrono>
-#include <cstdlib>
-#include <map>
 #include <string>
 
 #include <CLI/CLI.hpp>
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/cvar_cli.h>
 #include <rex/logging.h>
+#include <rex/platform/console.h>
+#include <rex/platform/env.h>
 #include <rex/result.h>
 #include <rex/version.h>
-
-#ifdef _WIN32
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -38,24 +33,22 @@ std::string TitleString() {
 }
 
 bool IsStderrTty() {
-#ifdef _WIN32
-  return _isatty(_fileno(stderr)) != 0;
-#else
-  return isatty(fileno(stderr)) != 0;
-#endif
+  return rex::platform::console::is_tty(stderr);
 }
 
 bool ColorEnabled(bool tty) {
-  if (const char* nc = std::getenv("NO_COLOR"); nc && *nc)
+  auto nc = rex::platform::env::get("NO_COLOR");
+  if (nc.has_value() && !nc->empty()) {
     return false;
+  }
   return tty;
 }
 
 void ConfigureLogging(const std::string& level, const std::string& log_file, bool verbose) {
-  std::map<std::string, std::string> category_levels;
-  auto config = rex::BuildLogConfig(log_file.empty() ? nullptr : log_file.c_str(),
-                                    verbose ? "trace" : level, category_levels);
+  auto config = rex::BuildLogConfig(verbose ? "trace" : level, {});
+  config.log_file = log_file;
   config.log_to_console = true;
+  rex::ApplyLogCvarOverrides(config);
   rex::InitLogging(config);
   rex::RegisterLogLevelCallback();
 }
@@ -66,6 +59,8 @@ int main(int argc, char** argv) {
   CLI::App app{TitleString(), "rexglue"};
   app.set_version_flag("--version", REXGLUE_VERSION_STRING);
   app.require_subcommand(1);
+  // Lets cvar overrides be spelled after the subcommand name.
+  app.fallthrough();
 
   rexglue::cli::CliContext ctx;
   std::string log_level = "info";
@@ -87,13 +82,19 @@ int main(int argc, char** argv) {
   rexglue::cli::RegisterInit(app, ctx, pending);
   rexglue::cli::RegisterRecompileTests(app, ctx, pending);
 
+  rex::cvar::RegisterCliOptions(app);
+
   CLI11_PARSE(app, argc, argv);
+
+  // The registry also exposes log_level, so honor that spelling.
+  if (rex::cvar::GetFlagSource("log_level") == rex::cvar::Source::kCommandLine) {
+    log_level = rex::cvar::GetFlagByName("log_level");
+  }
 
   ConfigureLogging(log_level, log_file, verbose);
   ctx.verbose = verbose;
   ctx.overwrite_existing = force;
   ctx.generate_despite_errors = force;
-  ctx.skip_upgrade_consent = force;
 
   bool tty = IsStderrTty();
   rexglue::ui::Init({.tty = tty, .color = ColorEnabled(tty)});
